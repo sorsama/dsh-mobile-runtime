@@ -82,10 +82,11 @@ def main():
     print(f"ELF files for {a.machine}: {len(ok) + len(low)} with LOAD segments, "
           f"{len(ok)} aligned >= {a.min}, {len(low)} below; "
           f"{len(noload)} without LOAD segments (objects); {len(foreign)} for other machines")
-    for e in sorted(low, key=lambda e: e["path"])[:400]:
+    shown = 400 if a.strict else 15
+    for e in sorted(low, key=lambda e: e["path"])[:shown]:
         print(f"  LOW  0x{e['minAlign']:x}  {e['path']}")
-    if len(low) > 400:
-        print(f"  ... and {len(low) - 400} more")
+    if len(low) > shown:
+        print(f"  ... and {len(low) - shown} more (all in the JSON report)")
     for e in foreign[:100]:
         print(f"  OTHER-MACHINE e_machine={e['machine']}  {e['path']}")
     aligns = {}

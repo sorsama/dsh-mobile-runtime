@@ -27,8 +27,10 @@ echo "extracted both layers in ${EXTRACT}s ($(du -sh "$R" | cut -f1))"
 # The exact command line of the app (spike report, section 5), plus the fake /proc files.
 export PROOT_LOADER=$PD/loader PROOT_TMP_DIR=$WORK/proot-tmp
 unset PROOT_NO_SECCOMP
+# Always called in a subshell (pipeline or &): exec makes that subshell proot itself,
+# so $! is proot's PID, as it is for the app's Process.
 proot_run() {
-  "$PD/proot" --kill-on-exit --link2symlink -0 \
+  exec "$PD/proot" --kill-on-exit --link2symlink -0 \
     -r "$R" \
     -b /dev -b /proc -b /sys -b /proc/self/fd:/dev/fd -b "$R/tmp:/dev/shm" \
     -b "$R/opt/dsh-runtime/proc/stat:/proc/stat" \
