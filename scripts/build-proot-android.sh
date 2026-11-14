@@ -98,9 +98,13 @@ for abi in arm64-v8a x86_64; do
   if readelf -dW "$OUT/android-$abi-libproot.so" | grep -qE 'RPATH|RUNPATH'; then
     echo "libproot.so has an RPATH/RUNPATH" >&2; exit 1
   fi
-  if strings "$OUT/android-$abi-libproot.so" "$OUT/android-$abi-libproot-loader.so" | grep -q 'com\.termux'; then
-    echo "a Termux path is compiled in" >&2; exit 1
+  # The only "com.termux" string in proot is a diagnostic about termux-exec; a real
+  # prefix path would contain com.termux/files.
+  strings "$OUT/android-$abi-libproot.so" | grep 'com\.termux' || true
+  if strings "$OUT/android-$abi-libproot.so" "$OUT/android-$abi-libproot-loader.so" | grep -q 'com\.termux/files'; then
+    echo "a Termux prefix path is compiled in" >&2; exit 1
   fi
+  strings "$OUT/android-$abi-libproot.so" | grep -E '^/proot-loader|PROOT_' | sort -u
   echo "== $abi loader"
   readelf -hW "$OUT/android-$abi-libproot-loader.so" | grep -E 'Type|Machine'
   readelf -dW "$OUT/android-$abi-libproot-loader.so" 2>&1 | head -3
