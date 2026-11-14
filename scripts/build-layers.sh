@@ -163,17 +163,24 @@ chroot "$R" /usr/bin/env -i HOME=/root USER=root LANG=C.UTF-8 TERM=dumb TMPDIR=/
   /bin/bash -euc "mkdir -p /opt/dsh && cd /opt/dsh && npm install --omit=dev --foreground-scripts --loglevel=warn '@deepseek-ai/dsh@$HARNESS_VERSION'"
 INSTALLED=$(chroot "$R" /opt/node/bin/node -p 'require("/opt/dsh/node_modules/@deepseek-ai/dsh/package.json").version')
 [ "$INSTALLED" = "$HARNESS_VERSION" ] || { echo "installed $INSTALLED, wanted $HARNESS_VERSION" >&2; exit 1; }
+
+log "dedupe identical nested packages (same name, version and content share one copy)"
+du -sb "$R/opt/dsh" | cut -f1 > "$WORK/harness-bytes-installed"
+find "$R/opt/dsh" -not -type d | wc -l > "$WORK/harness-files-installed"
+install -m 644 "$HERE/verify-resolution.mjs" "$R/tmp/verify-resolution.mjs"
+in_root() { chroot "$R" /usr/bin/env -i HOME=/root USER=root LANG=C.UTF-8 TERM=dumb TMPDIR=/tmp \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/node/bin "$@"; }
+in_root node /tmp/verify-resolution.mjs snapshot /opt/dsh/node_modules /tmp/resolution-before.json
+python3 "$HERE/dedupe-modules.py" "$R/opt/dsh/node_modules" "$OUT/dedupe-$ABI.json"
+in_root node /tmp/verify-resolution.mjs snapshot /opt/dsh/node_modules /tmp/resolution-after.json
+in_root node /tmp/verify-resolution.mjs compare /tmp/resolution-before.json /tmp/resolution-after.json /opt/dsh/node_modules
+find "$R/opt/dsh" -not -type d | wc -l > "$WORK/harness-files-deduped"
+log "dedupe: $(cat "$WORK/harness-files-installed") -> $(cat "$WORK/harness-files-deduped") files"
 cleanup_mounts; trap - EXIT
 cp -a "$WORK/resolv.conf.saved" "$R/etc/resolv.conf"
 rm -rf "$R"/tmp/* "$R"/tmp/.[!.]* "$R/root/.npm" "$R/root/.cache" "$R/root/.config"
 
-cat > "$R/usr/local/bin/dsh" <<'EOF'
-#!/bin/sh
-# DeepSeek Harness launcher (DSH Mobile runtime). exec keeps the PID, so the app
-# can stop the harness by signalling the guest's main process.
-exec /opt/node/bin/node /opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js "$@"
-EOF
-chmod 755 "$R/usr/local/bin/dsh"
+install -m 755 "$HERE/module-pack/dsh-launcher.sh" "$R/usr/local/bin/dsh"
 cat > "$R/opt/dsh/layer.json" <<EOF
 {"harnessPackage": "@deepseek-ai/dsh", "harnessVersion": "$HARNESS_VERSION", "releaseId": "$RELEASE_ID", "abi": "$ABI", "baseId": "$BASE_ID"}
 EOF
@@ -190,6 +197,12 @@ log "harness tree $(cat "$WORK/harness-bytes-before") -> $(cat "$WORK/harness-by
 log "ELF alignment (min 16 KB, ${STRICT:-report only})"
 python3 "$HERE/check-elf-alignment.py" --machine "$MACHINE" --min 16384 $STRICT \
   --json "$OUT/alignment-$ABI.json" "$R"
+
+########################################################################
+log "module pack (recorded with the harness from this tree, same node, same paths)"
+export ABI HARNESS_VERSION NODE_VERSION
+bash "$HERE/record-pack.sh" "$R" "$OUT"
+rm -rf "$R"/tmp/* "$R"/tmp/.[!.]* "$R/root/.dsh" "$R/root/.npm" "$R/root/.cache" "$R/root/.config"
 
 log "pack harness layer"
 EXCLUDES=()
@@ -208,6 +221,8 @@ def info(name, layer_id):
     return {"file": name + ".tar.zst", "id": layer_id, "size": os.path.getsize(p), "sha256": h.hexdigest(),
             "unpackedSize": stats["fileBytes"], "entries": stats["entries"], "stats": stats}
 prune = json.load(open(os.path.join(out, "prune-$ABI.json")))
+dedupe = json.load(open(os.path.join(out, "dedupe-$ABI.json")))
+pack = json.load(open(os.path.join(out, "pack-summary-$ABI.json")))
 align = json.load(open(os.path.join(out, "alignment-$ABI.json")))
 doc = {"abi": "$ABI", "debianArch": "$DEBARCH", "debianSuite": "$DEBIAN_SUITE", "debianSnapshot": "$DEBIAN_SNAPSHOT",
        "nodeVersion": "$NODE_VERSION", "harnessVersion": "$HARNESS_VERSION", "baseId": "$BASE_ID",
@@ -218,6 +233,13 @@ doc = {"abi": "$ABI", "debianArch": "$DEBARCH", "debianSuite": "$DEBIAN_SUITE", 
                  "removed": [r["path"] for r in prune["removed"]],
                  "harnessBytesBefore": int(open("$WORK/harness-bytes-before").read()),
                  "harnessBytesAfter": int(open("$WORK/harness-bytes-after").read())},
+       "dedupe": {"linkedCopies": dedupe["linkedCopies"], "filesSaved": dedupe["filesSaved"], "bytesSaved": dedupe["bytesSaved"],
+                  "filesBefore": dedupe["filesBefore"], "filesAfter": dedupe["filesAfter"],
+                  "groups": [{k: g[k] for k in ("package", "version", "linked", "shared", "filesSaved", "bytesSaved")} for g in dedupe["groups"]],
+                  "keptCopies": dedupe["skippedCopies"],
+                  "harnessBytesInstalled": int(open("$WORK/harness-bytes-installed").read()),
+                  "harnessFilesInstalled": int(open("$WORK/harness-files-installed").read())},
+       "modulePack": {k: pack[k] for k in ("buildId", "node", "arch", "packBytes", "modules", "resolveEntries", "fsEntries", "packageJsonFiles")},
        "alignment": {"checked": align["checked"], "aligned": align["aligned"], "below": len(align["below"]),
                      "histogram": align["histogram"], "strict": bool("$STRICT")}}
 json.dump(doc, open(sys.argv[1], "w"), indent=2)

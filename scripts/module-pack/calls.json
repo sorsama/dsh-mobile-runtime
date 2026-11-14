@@ -1,0 +1,29 @@
+{
+  "comment": "Gateway calls used to record the module pack and to compare pack on against pack off. Local calls only: nothing here needs the network or a model. Placeholders: @WORKSPACE@ (a temp directory) and @SESSION_ID@ (from the call that has a save field).",
+  "calls": [
+    { "method": "session/list", "args": { "_request": {} } },
+    { "method": "session/create", "args": { "request": { "cwd": "@WORKSPACE@" } }, "save": "sessionId" },
+    { "method": "session/list", "args": { "_request": {} } },
+    { "method": "session/state", "args": { "request": { "sessionId": "@SESSION_ID@" } } },
+    { "method": "session/projections", "args": { "request": { "sessionId": "@SESSION_ID@" } } },
+    { "method": "session/wait", "args": { "request": { "sessionId": "@SESSION_ID@" } } },
+    { "method": "session/rename", "args": { "request": { "sessionId": "@SESSION_ID@", "title": "pack check" } } },
+    { "method": "session/modelCatalog", "args": {} },
+    { "method": "session/canOpenWorkspacePath", "args": {} },
+    { "method": "agentPresets/list", "args": {} },
+    { "method": "agentPresets/read", "args": { "agentPreset": "standard" } },
+    { "method": "account/getState", "args": {} },
+    { "method": "settings/describe", "args": {} },
+    { "method": "credentials/describe", "args": { "refs": [] } },
+    { "method": "llm/listProviders", "args": {} },
+    { "method": "llm/listConfigurableProviders", "args": {} },
+    { "method": "pluginManager/listBundles", "args": {} },
+    { "method": "pluginManager/listPlugins", "args": {} },
+    { "method": "pluginManager/registries", "args": {} },
+    { "method": "pluginManager/listVersionExemptions", "args": {} },
+    { "method": "schedule/catalog", "args": {} },
+    { "method": "schedule/list", "args": { "request": {} } },
+    { "method": "schedule/deliveryLimits", "args": {} },
+    { "method": "directoryPicker/list", "args": { "path": "/opt/dsh-runtime/proc" } }
+  ]
+}

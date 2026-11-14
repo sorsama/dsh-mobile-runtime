@@ -5,31 +5,53 @@
 # Usage: smoke-test.sh <abi> <layers-dir> <proot-dir> <result.json>
 #   <proot-dir> holds `proot` and `loader` from build-proot-linux.sh.
 # The launch token is masked in the CI log and never written to any output file.
+#
+# What it proves (any failure stops the build, so nothing is released):
+#   1. the guest tools work (git, ripgrep, hard links, os.cpus());
+#   2. the harness starts with the module pack ON (the default) and OFF
+#      (DSH_RUNTIME_MODULE_PACK=0) and in both: 401 without a session, token exchange,
+#      authenticated calls; and the two modes return the same JSON for the same calls
+#      apart from ids and timestamps;
+#   3. a stale pack, a truncated pack, a damaged pack head, a missing pack, a missing
+#      preload and a preload that throws all leave a working harness, and the pack says
+#      so on stderr and never on stdout;
+#   4. a module outside /opt/dsh is read from disk, not from the pack;
+#   5. start-to-readiness is measured 3 times for pack on and pack off, and the path
+#      system calls of one start of each are counted when strace and sudo are available.
 set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
 ABI=$1; LAYERS=$(realpath "$2"); PD=$(realpath "$3"); RESULT=$(realpath -m "$4")
 WORK=$(realpath -m "${WORK:-$PWD/work/smoke-$ABI}")
 PORT=3080
 R=$WORK/rootfs
 LOG=$WORK/harness.log
+ERR=$WORK/harness.err
 if [ -d "$WORK" ]; then chmod -R u+w "$WORK" 2>/dev/null || true; rm -rf "$WORK"; fi
-mkdir -p "$R" "$WORK/proot-tmp"
+mkdir -p "$R" "$WORK/proot-tmp" "$WORK/out"
 
 now() { date +%s.%N; }
 secs() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", b - a }'; }
 redact() { sed -E 's/token=[A-Za-z0-9._~%-]+/token=<redacted>/g; s/(dsh-auth-[^=;]*=)[^;[:space:]]+/\1<redacted>/g'; }
+median3() { printf '%s\n' "$@" | sort -n | sed -n 2p; }
 
 t=$(now)
 zstd -dc --long=27 "$LAYERS/dsh-runtime-base-$ABI.tar.zst" | tar -xf - -C "$R"
 zstd -dc --long=27 "$LAYERS/dsh-runtime-harness-$ABI.tar.zst" | tar -xf - -C "$R"
 EXTRACT=$(secs "$t" "$(now)")
 echo "extracted both layers in ${EXTRACT}s ($(du -sh "$R" | cut -f1))"
+BUILD_ID=$(tr -d '[:space:]' < "$R/opt/dsh/build-id")
+PACKDIR=$R/opt/dsh/runtime-pack
+echo "module pack build id $BUILD_ID, $(stat -c %s "$PACKDIR/pack.bin") bytes"
 
 # The exact command line of the app (spike report, section 5), plus the fake /proc files.
+# GUEST_ENV adds variables to the guest's `env -i` list (for example DSH_RUNTIME_MODULE_PACK=0).
 export PROOT_LOADER=$PD/loader PROOT_TMP_DIR=$WORK/proot-tmp
 unset PROOT_NO_SECCOMP
+GUEST_ENV=
 # Always called in a subshell (pipeline or &): exec makes that subshell proot itself,
 # so $! is proot's PID, as it is for the app's Process.
 proot_run() {
+  # shellcheck disable=SC2086
   exec "$PD/proot" --kill-on-exit --link2symlink -0 \
     -r "$R" \
     -b /dev -b /proc -b /sys -b /proc/self/fd:/dev/fd -b "$R/tmp:/dev/shm" \
@@ -39,7 +61,7 @@ proot_run() {
     -w /root \
     /usr/bin/env -i HOME=/root USER=root LOGNAME=root \
       PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/node/bin \
-      LANG=C.UTF-8 TERM=dumb TMPDIR=/tmp \
+      LANG=C.UTF-8 TERM=dumb TMPDIR=/tmp $GUEST_ENV \
     /bin/bash -c "$1"
 }
 
@@ -64,15 +86,27 @@ RM_RETRY=$(grep -q "link2symlink quirk" "$WORK/guest-checks.txt" && echo true ||
 grep -q "^cleanup ok" "$WORK/guest-checks.txt" || { echo "guest checks did not finish" >&2; exit 1; }
 
 PROOT_PID=
+B=http://127.0.0.1:$PORT
+# The harness keeps its state under /root/.dsh. Every start gets a clean one, so the
+# responses of different starts can be compared.
+reset_state() { rm -rf "$R/root/.dsh" "$R/tmp/pack-ws"; mkdir -p "$R/tmp/pack-ws"; }
+fail_with_logs() {
+  echo "$1" >&2
+  echo "--- harness stdout (redacted)"; redact < "$LOG" | tail -40
+  echo "--- harness stderr (redacted)"; redact < "$ERR" | tail -40
+  exit 1
+}
+# start_harness [pack-env-value]: starts the harness through /usr/local/bin/dsh, like the app.
 start_harness() {
-  : > "$LOG"
+  GUEST_ENV=${1:+DSH_RUNTIME_MODULE_PACK=$1}
+  : > "$LOG"; : > "$ERR"
   T_START=$(now)
-  proot_run "umask 022; mkdir -p /root/work && cd /root/work && exec dsh web --no-open --port $PORT" >"$LOG" 2>&1 &
+  proot_run "umask 022; mkdir -p /root/work && cd /root/work && exec dsh web --no-open --port $PORT" >"$LOG" 2>"$ERR" &
   PROOT_PID=$!
   local deadline=$(( $(date +%s) + 600 ))
   until grep -q "dsh web: http://127.0.0.1:$PORT/?token=" "$LOG"; do
-    if ! kill -0 "$PROOT_PID" 2>/dev/null; then echo "harness exited early:"; redact < "$LOG" | tail -40; exit 1; fi
-    if [ "$(date +%s)" -ge "$deadline" ]; then echo "no readiness line after 600 s:"; redact < "$LOG" | tail -40; exit 1; fi
+    if ! kill -0 "$PROOT_PID" 2>/dev/null; then fail_with_logs "harness exited early"; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then fail_with_logs "no readiness line after 600 s"; fi
     sleep 0.1
   done
   READY=$(secs "$T_START" "$(now)")
@@ -98,39 +132,229 @@ stop_harness() {
 
 envelope() { printf '{"type":"client-request","rpcId":"ci-%s","method":"%s","payload":%s}' "$RANDOM" "$1" "$2"; }
 
-echo "== run 1 (first start after extraction)"
+# Ids, timestamps and the like differ between starts; everything else must be equal.
+normalize() {
+  sed -E 's/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/<uuid>/g;
+          s/"rpcId":"[^"]*"/"rpcId":"<id>"/g;
+          s/"entryId":"[0-9a-f]{8}"/"entryId":"<id>"/g;
+          s/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z/<iso>/g;
+          s/(:|\[|,)1[0-9]{12}(,|\}|\])/\1<ms>\2/g;
+          s/(:|\[|,)1[0-9]{9}(,|\}|\])/\1<s>\2/g' \
+  | redact
+}
+
+# check_session <label>: 401 without a session, token exchange, authenticated session/list.
+CHECKS=
+check_session() {
+  local jar=$WORK/cookies.txt body=$WORK/list.json c1 c2 c3
+  c1=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+        --data "$(envelope session/list '{"_request":{}}')" "$B/api/session/list")
+  rm -f "$jar"
+  c2=$(curl -s -o /dev/null -c "$jar" -w '%{http_code}' "$B/?token=$TOKEN")
+  grep -q 'dsh-auth-' "$jar" || { echo "no dsh-auth cookie was set" >&2; exit 1; }
+  c3=$(curl -s -o "$body" -b "$jar" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+        --data "$(envelope session/list '{"args":{"_request":{}}}')" "$B/api/session/list")
+  echo "$1: no-cookie $c1, token exchange $c2, authenticated session/list $c3 $(head -c 120 "$body" | redact)"
+  rm -f "$jar"
+  [ "$c1" = 401 ] || { echo "expected 401 without a session, got $c1" >&2; exit 1; }
+  [ "$c2" = 303 ] || [ "$c2" = 302 ] || { echo "expected a redirect from the token exchange, got $c2" >&2; exit 1; }
+  [ "$c3" = 200 ] && grep -q '"ok":true' "$body" || { echo "authenticated session/list failed" >&2; exit 1; }
+  C1=$c1; C2=$c2; C3=$c3
+}
+
+# run_calls <dir>: the calls of module-pack/calls.json with a session cookie; responses are
+# written, normalized, to <dir>/NN-method.json.
+run_calls() {
+  local dir=$1 jar=$WORK/cookies.txt n=0 sid= method args code out
+  mkdir -p "$dir"; rm -f "$jar"
+  curl -s -o /dev/null -c "$jar" "$B/?token=$TOKEN"
+  while IFS= read -r line; do
+    n=$((n + 1))
+    method=$(jq -r '.method' <<< "$line")
+    args=$(jq -c --arg ws /tmp/pack-ws --arg sid "$sid" '(.args | tostring | gsub("@WORKSPACE@"; $ws) | gsub("@SESSION_ID@"; $sid) | fromjson)' <<< "$line")
+    code=$(curl -s -o "$dir/raw" -b "$jar" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+            --data "$(envelope "$method" "{\"args\":$args}")" "$B/api/$method")
+    [ "$code" = 200 ] || { echo "call $method returned HTTP $code" >&2; exit 1; }
+    if [ "$(jq -r '.save // empty' <<< "$line")" = sessionId ]; then sid=$(jq -r '.result.value.sessionId' "$dir/raw"); fi
+    out=$dir/$(printf '%02d' "$n")-${method//\//_}.json
+    normalize < "$dir/raw" > "$out"
+    if [ "$method" = pluginManager/listPlugins ]; then
+      # The list follows the order in which plugins finished starting, which depends on timing
+      # and differs from start to start (also with the pack off). Compare it as a set.
+      jq -c '.result.value |= (map(tostring) | sort)' "$out" > "$out.tmp" && mv "$out.tmp" "$out"
+    fi
+  done < <(jq -c '.calls[]' "$HERE/module-pack/calls.json")
+  rm -f "$dir/raw" "$jar"
+  local ok; ok=$(grep -l '"ok":true' "$dir"/*.json | wc -l)
+  echo "$n calls made, $ok answered ok:true"
+  CALLS_N=$n; CALLS_OK=$ok
+}
+
+stdout_clean() { # the app parses stdout: nothing of the pack may appear there
+  if grep -q "module pack" "$LOG"; then fail_with_logs "the module pack wrote to stdout"; fi
+}
+
+########################################################################
+echo "== run 1: pack on (default), first start after extraction"
+reset_state
 start_harness
 FIRST=$READY
-B=http://127.0.0.1:$PORT
-C1=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
-      --data "$(envelope session/list '{"_request":{}}')" "$B/api/session/list")
-echo "no-cookie POST /api/session/list -> $C1"
-JAR=$WORK/cookies.txt; rm -f "$JAR"
-C2=$(curl -s -o /dev/null -c "$JAR" -w '%{http_code}' "$B/?token=$TOKEN")
-echo "GET /?token=<redacted> -> $C2"
-grep -q 'dsh-auth-' "$JAR" || { echo "no dsh-auth cookie was set" >&2; exit 1; }
-BODY=$WORK/list.json
-C3=$(curl -s -o "$BODY" -b "$JAR" -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
-      --data "$(envelope session/list '{"args":{"_request":{}}}')" "$B/api/session/list")
-echo "cookie POST /api/session/list -> $C3 $(head -c 200 "$BODY" | redact)"
-rm -f "$JAR"
+check_session "pack on"
+run_calls "$WORK/out/on"
+ON_OK=$CALLS_OK
+stdout_clean
 stop_harness
 STOP1=$STOP
-[ "$C1" = 401 ] || { echo "expected 401 without a session, got $C1" >&2; exit 1; }
-[ "$C2" = 303 ] || [ "$C2" = 302 ] || { echo "expected a redirect from the token exchange, got $C2" >&2; exit 1; }
-[ "$C3" = 200 ] && grep -q '"ok":true' "$BODY" || { echo "authenticated session/list failed" >&2; exit 1; }
+C1_ON=$C1; C2_ON=$C2; C3_ON=$C3
 
-echo "== run 2 (warm start)"
-start_harness
-WARM=$READY
+echo "== run 2: pack off (DSH_RUNTIME_MODULE_PACK=0)"
+reset_state
+start_harness 0
+check_session "pack off"
+run_calls "$WORK/out/off"
+OFF_OK=$CALLS_OK
 stop_harness
-redact < "$LOG" > "$WORK/harness-redacted.log"
+
+echo "== same calls, pack on vs pack off"
+[ "$ON_OK" = "$OFF_OK" ] || { echo "different calls answered ok: $ON_OK with the pack, $OFF_OK without" >&2; exit 1; }
+if ! diff -r "$WORK/out/on" "$WORK/out/off" > "$WORK/out/diff.txt"; then
+  echo "FAIL: responses differ between pack on and pack off:" >&2; head -60 "$WORK/out/diff.txt" >&2; exit 1
+fi
+echo "all $CALLS_N responses identical apart from ids and timestamps ($ON_OK answered ok:true)"
+EQUAL=true
+
+########################################################################
+echo "== degraded packs: the harness must still start, and say why on stderr"
+degraded() { # <label> <expected stderr text>
+  reset_state
+  start_harness
+  check_session "$1"
+  stdout_clean
+  if [ -n "$2" ]; then
+    grep -q "$2" "$ERR" || fail_with_logs "$1: expected '$2' on stderr"
+    echo "$1: stderr says: $(grep 'module pack' "$ERR" | head -1)"
+  fi
+  stop_harness
+}
+cp "$PACKDIR/pack.bin" "$WORK/pack.bin.orig"; cp "$R/opt/dsh/build-id" "$WORK/build-id.orig"
+cp "$PACKDIR/replay.mjs" "$WORK/replay.mjs.orig"; cp "$PACKDIR/preload.mjs" "$WORK/preload.mjs.orig"
+restore_pack() {
+  cp "$WORK/pack.bin.orig" "$PACKDIR/pack.bin"; cp "$WORK/build-id.orig" "$R/opt/dsh/build-id"
+  cp "$WORK/replay.mjs.orig" "$PACKDIR/replay.mjs"; cp "$WORK/preload.mjs.orig" "$PACKDIR/preload.mjs"
+}
+SIZE=$(stat -c %s "$PACKDIR/pack.bin")
+
+echo "build id file changed (stale pack)"
+echo "0000-not-the-build-id" > "$R/opt/dsh/build-id"; degraded "stale pack" "build id does not match"; restore_pack
+echo "pack truncated to half"
+truncate -s $((SIZE / 2)) "$PACKDIR/pack.bin"; degraded "truncated pack" "module pack: off"; restore_pack
+echo "pack truncated to 5 bytes"
+truncate -s 5 "$PACKDIR/pack.bin"; degraded "tiny pack" "module pack: off"; restore_pack
+echo "pack head overwritten with zeros"
+head -c 4096 /dev/zero | dd of="$PACKDIR/pack.bin" bs=4096 count=1 conv=notrunc 2>/dev/null; degraded "zeroed pack head" "module pack: off"; restore_pack
+echo "pack file removed"
+rm -f "$PACKDIR/pack.bin"; degraded "missing pack" "module pack: off"; restore_pack
+echo "build id file removed"
+rm -f "$R/opt/dsh/build-id"; degraded "missing build id" "module pack: off"; restore_pack
+echo "replay module throws"
+printf 'throw new Error("boom");\n' > "$PACKDIR/replay.mjs"; degraded "throwing preload" "preload failed"; restore_pack
+echo "replay module has a syntax error"
+printf 'export default {{{;\n' > "$PACKDIR/replay.mjs"; degraded "broken preload" "preload failed"; restore_pack
+echo "preload file removed (the launcher falls back to plain node)"
+rm -f "$PACKDIR/preload.mjs"; degraded "missing preload" ""; restore_pack
+echo "the degraded cases above restored the pack:"
+cmp "$WORK/pack.bin.orig" "$PACKDIR/pack.bin" && echo "pack restored"
+DEGRADED=9
+
+########################################################################
+echo "== a module outside /opt/dsh comes from disk, never from the pack"
+OUTSIDE=$R/root/pack-outside
+rm -rf "$OUTSIDE"; mkdir -p "$OUTSIDE/node_modules/outside-pkg" "$OUTSIDE/node_modules/semver"
+printf '{"name":"outside-pkg","version":"1.0.0","type":"module","exports":"./index.js"}\n' > "$OUTSIDE/node_modules/outside-pkg/package.json"
+# A package that has the name of one the harness itself uses: the user's copy must win here.
+printf '{"name":"semver","version":"0.0.1","type":"module","exports":"./index.js"}\n' > "$OUTSIDE/node_modules/semver/package.json"
+printf 'export default "semver-outside";\n' > "$OUTSIDE/node_modules/semver/index.js"
+cat > "$OUTSIDE/check.mjs" <<'EOF'
+import fs from 'node:fs';
+import outside from 'outside-pkg';
+import semver from 'semver';
+// An in-tree file first, so the pack has something to serve and we can see the difference.
+const inTree = await import('/opt/dsh/node_modules/@deepseek-ai/dsh-base/package.json', { with: { type: 'json' } });
+const pj = JSON.parse(fs.readFileSync('/root/pack-outside/node_modules/outside-pkg/package.json', 'utf8'));
+console.log(JSON.stringify({ outside, semver, version: pj.version, inTree: inTree.default.name, exists: fs.existsSync('/root/pack-outside/node_modules/outside-pkg/index.js') }));
+EOF
+run_outside() { # <expected value>
+  printf 'export default "%s";\n' "$1" > "$OUTSIDE/node_modules/outside-pkg/index.js"
+  sed -i -E "s/\"version\":\"[^\"]*\"/\"version\":\"$1\"/" "$OUTSIDE/node_modules/outside-pkg/package.json"
+  ( GUEST_ENV="DSH_RUNTIME_MODULE_PACK_DEBUG=1 DSH_RUNTIME_MODULE_PACK_MISSES=/tmp/outside-misses.txt"
+    proot_run 'cd /root/pack-outside && node --import /opt/dsh/runtime-pack/preload.mjs check.mjs' ) > "$WORK/outside.out" 2> "$WORK/outside.err" \
+    || { cat "$WORK/outside.out" "$WORK/outside.err"; echo "outside check failed to run" >&2; exit 1; }
+  grep -q 'module pack: on:' "$WORK/outside.err" || { cat "$WORK/outside.err"; echo "the pack was not on" >&2; exit 1; }
+  grep -q "\"outside\":\"$1\"" "$WORK/outside.out" && grep -q '"semver":"semver-outside"' "$WORK/outside.out" \
+    && grep -q "\"version\":\"$1\"" "$WORK/outside.out" && grep -q '"exists":true' "$WORK/outside.out" \
+    || { cat "$WORK/outside.out"; echo "outside-tree module did not come from disk" >&2; exit 1; }
+  grep -q 'file:///root/pack-outside/node_modules/outside-pkg/index.js' "$R/tmp/outside-misses.txt" \
+    || { cat "$R/tmp/outside-misses.txt"; echo "the outside module was not reported as a pack miss" >&2; exit 1; }
+  echo "outside value $1 read from disk: $(cat "$WORK/outside.out") | $(grep 'stats:' "$WORK/outside.err")"
+}
+run_outside one
+run_outside two   # same file, same path, new content: a pack would serve the old one
+rm -rf "$OUTSIDE" "$R/tmp/outside-misses.txt"
+OUTSIDE_OK=true
+
+########################################################################
+echo "== start to readiness, median of 3, pack on and pack off (interleaved)"
+ON_T=(); OFF_T=()
+for i in 1 2 3; do
+  reset_state; start_harness; ON_T+=("$READY"); stop_harness
+  reset_state; start_harness 0; OFF_T+=("$READY"); stop_harness
+done
+ON_MED=$(median3 "${ON_T[@]}"); OFF_MED=$(median3 "${OFF_T[@]}")
+echo "pack on  ${ON_T[*]} -> median $ON_MED s"
+echo "pack off ${OFF_T[*]} -> median $OFF_MED s"
+
+########################################################################
+echo "== path system calls of one start (strace -f -c, on the runner natively; best effort)"
+ON_SC=null; OFF_SC=null
+count_syscalls() { # <pack value> -> prints the number of path syscalls, or nothing
+  local sc=$WORK/strace-$1.txt out=$WORK/strace-$1.out
+  reset_state
+  sudo -n unshare -m sh -c "
+    mount --bind /proc '$R/proc'; mount --bind /dev '$R/dev'
+    exec strace -f -c -e trace=%file -o '$sc' chroot '$R' /usr/bin/env -i HOME=/root USER=root LOGNAME=root \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/node/bin LANG=C.UTF-8 TERM=dumb TMPDIR=/tmp \
+      DSH_RUNTIME_MODULE_PACK=$1 /bin/bash -c 'umask 022; mkdir -p /root/work && cd /root/work && exec dsh web --no-open --port $PORT'
+  " > "$out" 2>&1 &
+  local pid=$!
+  for _ in $(seq 1 600); do grep -q "dsh web: http://127.0.0.1:$PORT/?token=" "$out" 2>/dev/null && break; sleep 0.1; done
+  sleep 0.5
+  sudo -n pkill -TERM -f "bin.js web --no-open --port $PORT" || true
+  for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  sudo -n pkill -KILL -f "bin.js web --no-open --port $PORT" || true
+  wait "$pid" 2>/dev/null || true
+  sudo -n chown -R "$(id -u):$(id -g)" "$R/root" "$R/tmp" 2>/dev/null || true
+  awk '$NF == "total" { print $4 }' "$sc" 2>/dev/null | head -1
+}
+if command -v strace >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  ON_SC=$(count_syscalls 1 || true); OFF_SC=$(count_syscalls 0 || true)
+  [[ "$ON_SC" =~ ^[0-9]+$ ]] || ON_SC=null
+  [[ "$OFF_SC" =~ ^[0-9]+$ ]] || OFF_SC=null
+  echo "path syscalls: pack on $ON_SC, pack off $OFF_SC"
+  [ -f "$WORK/strace-1.txt" ] && head -14 "$WORK/strace-1.txt"
+else
+  echo "strace or passwordless sudo is not available: syscall counts skipped"
+fi
+{ redact < "$LOG"; echo "--- stderr"; redact < "$ERR"; } > "$WORK/harness-redacted.log"
 unset TOKEN
 
 cat > "$RESULT" <<EOF
 {"abi": "$ABI", "runner": "$(uname -m) $(nproc) CPUs", "extractSeconds": $EXTRACT,
- "firstStartToReadySeconds": $FIRST, "warmStartToReadySeconds": $WARM,
- "unauthenticatedStatus": $C1, "tokenExchangeStatus": $C2, "sessionListStatus": $C3,
- "stop": "$STOP1", "osCpus": $CPUS, "l2sRmRetryNeeded": $RM_RETRY}
+ "firstStartToReadySeconds": $FIRST, "warmStartToReadySeconds": $ON_MED,
+ "unauthenticatedStatus": $C1_ON, "tokenExchangeStatus": $C2_ON, "sessionListStatus": $C3_ON,
+ "stop": "$STOP1", "osCpus": $CPUS, "l2sRmRetryNeeded": $RM_RETRY,
+ "modulePack": {"buildId": "$BUILD_ID", "packOn": {"startSeconds": [$(IFS=,; echo "${ON_T[*]}")], "medianSeconds": $ON_MED, "pathSyscalls": $ON_SC},
+  "packOff": {"startSeconds": [$(IFS=,; echo "${OFF_T[*]}")], "medianSeconds": $OFF_MED, "pathSyscalls": $OFF_SC},
+  "callsCompared": $CALLS_N, "callsOk": $ON_OK, "responsesIdenticalOnVsOff": $EQUAL,
+  "degradedCasesPassed": $DEGRADED, "outsideTreeModuleFromDisk": $OUTSIDE_OK}}
 EOF
 cat "$RESULT"

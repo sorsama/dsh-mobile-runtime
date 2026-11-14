@@ -67,6 +67,11 @@ def main():
         doc = json.load(open(os.path.join(d, f"layers-{abi}.json")))
         layer_docs[abi] = doc
         smoke[abi] = json.load(open(os.path.join(d, f"smoke-{abi}.json")))
+        # The smoke test already stops the build on a failure; this makes the release itself refuse too.
+        m = smoke[abi]["modulePack"]
+        assert m["responsesIdenticalOnVsOff"] is True and m["outsideTreeModuleFromDisk"] is True, f"{abi}: module pack checks"
+        assert m["degradedCasesPassed"] >= 9 and m["callsOk"] >= 20, f"{abi}: module pack checks"
+        assert m["buildId"] == doc["modulePack"]["buildId"], f"{abi}: smoke test ran another pack"
         proot = [
             asset(os.path.join(pa, f"android-{abi}-libproot.so"), a.out, installAs="libproot.so"),
             asset(os.path.join(pa, f"android-{abi}-libproot-loader.so"), a.out, installAs="libproot-loader.so"),
@@ -81,6 +86,11 @@ def main():
                           "owns": ["/"] if name == "base" else HARNESS_PATHS})
             if name == "base":
                 entry["excludes"] = HARNESS_PATHS
+            else:
+                # Optional extra fields (unknown fields must be ignored by the app).
+                mp, dd = doc["modulePack"], doc["dedupe"]
+                entry["modulePack"] = {"buildId": mp["buildId"], "packBytes": mp["packBytes"], "modules": mp["modules"]}
+                entry["dedupe"] = {"copiesLinked": dd["linkedCopies"], "filesSaved": dd["filesSaved"], "bytesSaved": dd["bytesSaved"]}
             layers.append(entry)
         archs[abi] = {"debianArch": doc["debianArch"], "proot": proot, "layers": layers}
         for extra in (f"debian-packages-{abi}.txt",):
@@ -114,6 +124,19 @@ def main():
             "fakeProc": [{"source": f"/opt/dsh-runtime/proc/{n}", "target": f"/proc/{n}"}
                          for n in ("stat", "loadavg", "uptime")],
             "resolvConf": "/etc/resolv.conf",
+            # Optional. The app needs to do nothing: /usr/local/bin/dsh turns the pack on by itself.
+            "startup": {
+                "modulePack": {
+                    "enabledByDefault": True,
+                    "disableEnv": "DSH_RUNTIME_MODULE_PACK",
+                    "disableValue": "0",
+                    "directory": "/opt/dsh/runtime-pack",
+                    "buildIdFile": "/opt/dsh/build-id",
+                    "mechanism": "node --import preload that uses module.registerHooks; falls back to normal Node.js on any miss",
+                    "validatedNodeVersion": node_version,
+                },
+                "dedupe": "identical nested packages (same name, version and content) are symlinks to one shared copy",
+            },
         },
         "archs": archs,
     }
@@ -139,13 +162,24 @@ def main():
     for abi in ABIS:
         for l in archs[abi]["layers"]:
             lines.append(f"| {abi} | {l['name']} | `{l['file']}` | {mib(l['size'])} | {mib(l['unpackedSize'])} | {l['entries']:,} |")
-    lines += ["", "| Architecture | proot | loader | Smoke test: first start to ready | warm start | Pruned |",
-              "|---|---|---|---|---|---|"]
+    lines += ["", "| Architecture | proot | loader | Smoke test: first start to ready | Pruned |",
+              "|---|---|---|---|---|"]
     for abi in ABIS:
         p, s, pr = archs[abi]["proot"], smoke[abi], layer_docs[abi]["prune"]
         lines.append(f"| {abi} | {p[0]['size']:,} B | {p[1]['size']:,} B | {s['firstStartToReadySeconds']} s "
-                     f"| {s['warmStartToReadySeconds']} s | {pr['removedFiles']} files, {mib(pr['removedBytes'])} |")
+                     f"| {pr['removedFiles']} files, {mib(pr['removedBytes'])} |")
+    lines += ["", "Start-up work in the harness layer (nothing for the app to do):", "",
+              "| Architecture | Module pack | Start to ready, pack on (median of 3) | pack off | Path syscalls on / off | Shared nested copies |",
+              "|---|---|---|---|---|---|"]
+    for abi in ABIS:
+        mp, dd, s = layer_docs[abi]["modulePack"], layer_docs[abi]["dedupe"], smoke[abi]["modulePack"]
+        sc_on, sc_off = s["packOn"]["pathSyscalls"], s["packOff"]["pathSyscalls"]
+        sc = f"{sc_on:,} / {sc_off:,}" if sc_on and sc_off else "not measured"
+        lines.append(f"| {abi} | {mib(mp['packBytes'])}, {mp['modules']:,} modules | {s['packOn']['medianSeconds']} s "
+                     f"| {s['packOff']['medianSeconds']} s | {sc} "
+                     f"| {dd['linkedCopies']} links, {dd['filesSaved']:,} files, {mib(dd['bytesSaved'])} saved |")
     lines += ["",
+              "The module pack is on by default and `DSH_RUNTIME_MODULE_PACK=0` turns it off (see the README). "
               "Smoke test times are from the GitHub Actions runner under a Linux build of the same proot "
               "commit, not from a phone.",
               "",

@@ -52,6 +52,8 @@ Asset URLs are `assetBaseUrl` from the manifest plus the file name.
     proc/uptime
   opt/dsh/                harness layer: npm project with node_modules
     layer.json            {"harnessPackage", "harnessVersion", "releaseId", "abi", "baseId"}
+    build-id              identity of this /opt/dsh build; the module pack is valid only for it
+    runtime-pack/         module pack (pack.bin) and its preload, see "Startup: shared packages and the module pack"
   usr/local/bin/dsh       harness layer: launcher script, exec's node on the harness
 ```
 
@@ -101,6 +103,7 @@ unless the app moves it across).
 | `runtime.readinessPrefix` | string | `dsh web: http://127.0.0.1:`. The harness prints this, followed by `<port>/?token=<token>`, when it is ready. |
 | `runtime.fakeProc[]` | array of `{source, target}` | Files to bind over `/proc` entries (see "Running"). Paths are inside the guest. |
 | `runtime.resolvConf` | string | `/etc/resolv.conf`, the file the app should rewrite with the device DNS servers. |
+| `runtime.startup` | object, optional | Describes the start-up work in the harness layer. `startup.modulePack` has `enabledByDefault` (true), `disableEnv` (`DSH_RUNTIME_MODULE_PACK`), `disableValue` (`0`), `directory`, `buildIdFile`, `mechanism` and `validatedNodeVersion`. For information only: the app needs no change. |
 | `archs` | object | Keyed by Android ABI (`arm64-v8a`, `x86_64`). |
 | `archs.<abi>.debianArch` | string | `arm64` or `amd64`. |
 | `archs.<abi>.proot[]` | array of file | The two proot binaries, each with `installAs` (`libproot.so`, `libproot-loader.so`). |
@@ -122,6 +125,7 @@ A **layer** is a file object plus:
 | `entries` | Number of tar entries. Use it for progress. |
 | `owns` | Guest paths this layer owns (`["/"]` for base). |
 | `excludes` | Base only: paths inside `owns` that belong to other layers. |
+| `modulePack`, `dedupe` | Harness only, optional: `{buildId, packBytes, modules}` of the module pack and `{copiesLinked, filesSaved, bytesSaved}` of the shared nested packages. For information only. |
 
 ## Verifying a release
 
@@ -224,6 +228,106 @@ Notes:
   proot; `dsh` and `bash -c ... exec` keep it the node process), wait up to about 5 seconds,
   then SIGQUIT proot, then SIGKILL anything left. `Process.destroy()` alone does nothing.
 - The app needs the `INTERNET` permission (the guest inherits the `inet` group).
+- The harness starts faster with the module pack, which `/usr/local/bin/dsh` turns on by
+  itself. To turn it off, for example while chasing a start-up problem, add
+  `DSH_RUNTIME_MODULE_PACK=0` to the `env -i` list. See "Startup: shared packages and the
+  module pack".
+
+## Startup: shared packages and the module pack
+
+Under proot every file system call costs about 70 microseconds on a PC and more on a phone,
+and a plain start of the harness makes roughly 52,000 of them. Two build steps in the harness
+layer remove most of that. Neither needs any change in the app.
+
+### Shared nested packages
+
+npm gives each package its own private copy of a dependency it cannot share. In
+`@deepseek-ai/dsh` 57 packages each carry a copy of `zod` 4.4.3 (about 40,000 files and
+240 MiB). `scripts/dedupe-modules.py` keeps one copy of every package that appears several
+times with the same name, the same version and byte-identical content, and replaces the other
+copies with relative symlinks. A group is touched only when:
+
+- the whole directory trees are identical: names, file contents (SHA-256), exec bits, and
+  symlinks (a symlink that points out of its package is not accepted);
+- every dependency the copies declare (`dependencies`, `optionalDependencies`,
+  `peerDependencies`) resolves, with Node's lookup rules, to the same content from the place
+  of each copy and from the place of the shared copy. This is what guarantees that moving a
+  copy never changes which version any package gets.
+
+A copy that fails a rule is left alone, and the build log says which one and why. The shared
+copy is the one at the top level of `node_modules` if there is one, otherwise it is moved to
+`node_modules/.dsh-shared/<name>@<version>`. Node resolves a symlink to its real path, so all
+users share one module instance. After the step, `scripts/verify-resolution.mjs` takes a
+snapshot of "which name@version does every package location get for every dependency it
+declares" before and after, and the build fails if any answer changed. The numbers (files,
+bytes, groups) are in the build log, in `dedupe-<abi>.json` and in the release notes. Layers
+may already contain symlinks, so the layer format does not change.
+
+### Module pack
+
+`/usr/local/bin/dsh` starts the harness as `exec /opt/node/bin/node --import
+/opt/dsh/runtime-pack/preload.mjs .../lib/bin.js "$@"`. The guest's main process is still
+node. The preload answers Node's module resolve and load steps, and a few `fs` calls, for
+files under `/opt/dsh` from one file, `/opt/dsh/runtime-pack/pack.bin`, recorded at build
+time. A start then needs about 4,000 path calls instead of 37,000 (after sharing packages)
+or 55,000 (before).
+
+| Variable | Effect |
+|---|---|
+| `DSH_RUNTIME_MODULE_PACK` | `0`, `off`, `false` or `no` (any case) turns the pack off. Unset or any other value leaves it on. Set it in the guest's environment, for example in the `env -i ...` list of the command line above. This is the kill switch. |
+| `DSH_RUNTIME_MODULE_PACK_DEBUG` | `1` makes the preload print on stderr that it is on and, at exit, how many resolves, loads and fs answers it served. For diagnosis only. |
+
+What the pack contains and what it never serves:
+
+- It holds resolve results, module sources (ES modules, CommonJS and JSON), `package.json`
+  files read with `fs.readFileSync`, and the answers of `fs.existsSync`,
+  `fs.realpathSync`, `fs.realpathSync.native` and `fs.readlinkSync`, only for paths and file
+  URLs under `/opt/dsh`.
+- A resolve is served only when the importing file is under `/opt/dsh` (or the specifier is
+  already an absolute path under it) and the answer is under `/opt/dsh` or a Node.js built-in.
+  Everything outside the tree, such as your home directory, workspaces, and plugins
+  installed later under `/root/.dsh`, always goes through normal Node.js resolution and
+  file reading. A package of the same name in your own `node_modules` is not shadowed.
+- Anything the pack does not know (a miss) is handled by Node.js as if the pack did not exist.
+  Every hook and every `fs` wrapper catches its own exceptions and falls back the same way.
+- The pack is not used in worker threads or in child processes started with an IPC channel.
+
+How it stays correct:
+
+- **Build id.** The pack carries a build id: a hash of the structure of `/opt/dsh`
+  (every path, size and mode, not the contents), the harness version, the architecture and
+  the Node.js version. At start the preload reads `/opt/dsh/build-id` (one small read) and
+  compares. Any mismatch turns the pack off. It also checks the pack's magic words and exact
+  size, the Node.js version, platform and CPU architecture, and the size of
+  `/opt/dsh/node_modules/.package-lock.json` (one `stat`), so a truncated or damaged pack, a
+  pack for another build, or an `npm install` into `/opt/dsh` is noticed. There are no
+  per-file checks, because those would bring the system calls back.
+- **Switching off is quiet.** When the pack turns itself off it prints one line starting
+  with `dsh module pack: off:` to stderr and nothing to stdout, so the readiness line is
+  never disturbed. The kill switch prints nothing.
+- **If the preload fails.** `preload.mjs` catches everything, including a failure to load
+  `replay.mjs`. A missing preload file is checked by the launcher with `test -f`.
+- **What it does not detect.** Changes to a single file under `/opt/dsh` that keep every
+  file size, or bit flips inside a valid pack, are not detected. `/opt/dsh` belongs to the
+  harness layer and is replaced as a whole (see "Layers and updates"); do not edit it.
+
+This relies on `module.registerHooks`, an API that Node.js does not yet document as stable.
+It was developed and validated with Node.js
+24.22.3, the version this runtime ships, and the preload records that version and refuses a
+pack made by another one. Node.js is pinned in the base layer, so the pack and its node always
+belong together unless something replaces `/opt/node` alone; if a Node.js without
+`registerHooks` ever runs it, the preload turns the pack off and the harness runs the normal
+way, slower but correct. Bumping `NODE_VERSION` in `scripts/versions.env` rebuilds the pack,
+and the smoke test below has to pass before a release.
+
+The pack is recorded in the build (`scripts/record-pack.sh`) by running the real harness
+from the finished tree, with the same node binary and the same paths the bundle ships: it
+starts, exchanges the token, and makes the calls in `scripts/module-pack/calls.json`
+(`session/list`, `session/create` in a temporary workspace, and a few cheap calls that pull
+in lazily loaded modules: settings, providers, plugin manager, schedule and others), then
+fetches the web page. A start that does something else may miss and fall back. The recording
+run must leave `/opt/dsh` unchanged, and the pack is replayed once more to check that it
+switches on and answers nearly everything.
 
 ## How the build works
 
@@ -241,7 +345,9 @@ Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/bui
    against `SHASUMS256.txt`, whose GPG signature is checked against the Node.js release
    keys), applies the root file system fixes, and packs the base layer. It then installs the
    harness with npm inside the tree (chroot, install scripts enabled), proves nothing outside
-   the harness paths changed, prunes, checks ELF alignment and packs the harness layer.
+   the harness paths changed, shares identical nested packages (`scripts/dedupe-modules.py`,
+   checked with `scripts/verify-resolution.mjs`), prunes, checks ELF alignment, records the
+   module pack (`scripts/record-pack.sh`) and packs the harness layer.
 3. **Pruning** (`scripts/prune.py`) only removes directories named for another OS or another
    CPU architecture (such as `prebuilds/win32-x64` or `prebuilds/linux-arm64` on x86_64) that
    hold native binaries and no JavaScript or package files. Every removal and its size is in
@@ -253,8 +359,20 @@ Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/bui
    (git, ripgrep, hard links, `os.cpus()`), and starts the harness under a Linux build of the
    same proot commit with the command line above. It waits for the readiness line, expects
    401 from `/api/session/list` without a session, exchanges the token for the session cookie,
-   expects 200 from an authenticated `/api/session/list`, stops the harness with the stop
-   sequence above, and measures a second, warm start. The token is masked in the log.
+   expects 200 from an authenticated `/api/session/list`, and stops the harness with the stop
+   sequence above. It does this with the module pack on and with `DSH_RUNTIME_MODULE_PACK=0`,
+   makes the same two dozen calls (`scripts/module-pack/calls.json`) in both modes and requires
+   identical JSON apart from ids and timestamps. It then starts the harness with a stale build
+   id, a truncated pack, a pack with a zeroed head, a missing pack, a missing build id, a
+   preload that throws, a preload with a syntax error and a missing preload: every one must
+   still reach readiness and pass the session checks, with a pack message only on stderr.
+   It runs a tiny ES module package under `/root` twice with different contents and requires the
+   current content each time, so a module outside `/opt/dsh` is never served from the pack.
+   Finally it measures the start to readiness three times for pack on and pack off and, when
+   `strace` and passwordless `sudo` exist (they do on GitHub runners), counts the path system
+   calls of one start of each natively. These results are in the job summary and the release
+   notes. The token is masked in the log. A failure anywhere stops the build before any
+   release is created.
 5. **Release**: `scripts/assemble-release.py` writes `manifest.json` and the notes,
    `scripts/sign-manifest.sh` signs it with the `RUNTIME_SIGNING_KEY` secret (and checks the
    signature against the committed public key), writes `SHA256SUMS.txt`, and the job creates

@@ -145,7 +145,7 @@ jobs:
       - name: Linux proot for the smoke test (same commit)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends libtalloc-dev zstd > /dev/null
+          sudo apt-get install -y -qq --no-install-recommends libtalloc-dev zstd strace jq > /dev/null
           bash scripts/build-proot-linux.sh "$RUNNER_TEMP/proot-linux"
       - name: Build base and harness layers
         run: |
@@ -166,7 +166,19 @@ jobs:
         run: |
           {
             echo "### $ABI"
-            [ -f "out/layers-$ABI/layers-$ABI.json" ] && { echo '```json'; jq '{base: (.base | del(.stats)), harness: (.harness | del(.stats)), prune, alignment}' "out/layers-$ABI/layers-$ABI.json"; echo '```'; }
+            if [ -f "out/layers-$ABI/smoke-$ABI.json" ]; then
+              echo
+              echo "| Start to readiness (proot, median of 3) | Pack on | Pack off | Path syscalls on / off |"
+              echo "|---|---|---|---|"
+              jq -r '.modulePack | "| first start after extraction: \(.packOn.startSeconds[0]) s | \(.packOn.medianSeconds) s | \(.packOff.medianSeconds) s | \(.packOn.pathSyscalls // "n/a") / \(.packOff.pathSyscalls // "n/a") |"' "out/layers-$ABI/smoke-$ABI.json"
+              echo
+              jq -r '.modulePack | "Same JSON for \(.callsCompared) calls pack on vs off: \(.responsesIdenticalOnVsOff); degraded-pack cases passed: \(.degradedCasesPassed); module outside /opt/dsh read from disk: \(.outsideTreeModuleFromDisk)."' "out/layers-$ABI/smoke-$ABI.json"
+            fi
+            if [ -f "out/layers-$ABI/layers-$ABI.json" ]; then
+              echo
+              jq -r '"Dedupe: \(.dedupe.linkedCopies) copies became symlinks, \(.dedupe.filesSaved) files and \(.dedupe.bytesSaved / 1048576 | floor) MiB saved (installed tree: \(.dedupe.harnessFilesInstalled) files, \(.dedupe.harnessBytesInstalled / 1048576 | floor) MiB). Module pack: \(.modulePack.packBytes / 1048576 | floor) MiB, \(.modulePack.modules) modules, build \(.modulePack.buildId)."' "out/layers-$ABI/layers-$ABI.json"
+            fi
+            [ -f "out/layers-$ABI/layers-$ABI.json" ] && { echo '```json'; jq '{base: (.base | del(.stats)), harness: (.harness | del(.stats)), dedupe: (.dedupe | del(.groups)), modulePack, prune, alignment}' "out/layers-$ABI/layers-$ABI.json"; echo '```'; }
             [ -f "out/layers-$ABI/smoke-$ABI.json" ] && { echo '```json'; cat "out/layers-$ABI/smoke-$ABI.json"; echo '```'; }
           } >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v7
