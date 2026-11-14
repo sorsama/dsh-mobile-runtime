@@ -90,6 +90,111 @@ directory, unpack the harness on top, then swap directories. User data should no
 the layers' paths (the harness keeps its state under `/root`; a base update replaces `/root`
 unless the app moves it across).
 
+## How updates reach the app
+
+New harness versions reach phones without an app update and without anyone cutting a release
+by hand. The GitHub Actions workflow **Build runtime** does it.
+
+**The schedule.** The workflow runs every 6 hours (cron `17 */6 * * *`, UTC) and on demand. The
+first job asks npm for the dist-tag `latest` of `@deepseek-ai/dsh` and compares it with
+`harness.version` in the manifest of this repository's latest release (after checking that
+manifest's signature). If they are equal, the run ends after that one short job and builds
+nothing. If npm has a different version, the workflow builds that exact version and publishes it
+as a new release. The new release keeps the previous release's `minAppVersion` unless you
+dispatch by hand and set another one.
+
+**Release ids and sequence.** An automatic release id is the UTC date plus the next free number
+of that day, for example `2026.11.15-2`. The number comes from the existing release tags, so ids
+are unique, and they order by date and then by number (compare the number as a number: `-10` comes
+after `-9`). `sequence` is the build time in Unix seconds, and never lower than the previous
+release's `sequence` plus one, so it always increases, even for two releases in one second.
+
+**One release per harness version.** At most one run builds at a time (a single concurrency
+group), so two runs never build the same version together. If any release already carries the
+harness version npm reports (for example because npm moved `latest` back to an older version),
+the scheduled run does not publish a second one. Dispatch by hand with `rebuild` to force it.
+
+**The gates.** Nothing is published unless every one of these passes; they are the same checks
+that were always part of the build (see "How the build works"):
+
+- proot builds for both ABIs, with 16 KB ELF alignment checked;
+- the layer build, including the proof that the harness install touched only the harness paths
+  and that sharing nested packages changed no dependency resolution;
+- ELF alignment of the arm64 bundle;
+- the smoke test under proot for both ABIs: the module pack on and off give the same JSON, all
+  degraded-pack cases still start, and a module outside `/opt/dsh` is read from disk;
+- the manifest signature, checked against the public key committed here;
+- the previous release's manifest, which must verify against the same key, and the layer id check
+  against it (a layer id is never reused for different content);
+- after publishing, the release is downloaded again without a token and verified: the manifest
+  signature, every hash in `SHA256SUMS.txt`, and the `previous` pointer (see below). A release that
+  fails this is deleted again, with its tag.
+
+**Node.js.** The harness declares the Node.js it needs in `engines.node`. If the Node.js in
+`scripts/versions.env` (or in the previous release, when that is newer) meets it, the base layer
+stays as it is. If not, the base layer is rebuilt with the newest Node.js 24.x release that does
+(`scripts/node-engine.mjs`). If the harness needs a Node.js that no 24.x release meets, the build
+fails before anything is built, with a message that says so: a new Node.js major is a deliberate
+change (bump `NODE_VERSION`, check the module pack, run the workflow by hand). If a bundle fails
+to start in the smoke test for any reason, the log ends with a line that says whether the
+harness's `engines.node` is met by the bundled Node.js.
+
+**What happens on failure.** A failed build publishes nothing, because the release job only
+runs when every build job and gate before it passed. A scheduled run that wanted to build and
+failed opens a GitHub issue titled `Automatic runtime build failed for @deepseek-ai/dsh <version>`
+(label `runtime-auto-release`) with a link to the run and the failed jobs. If an open issue with
+that title already exists, the run adds a comment to it instead of opening another one. When a
+release with that harness version is published later, the run comments and closes the issue.
+The next scheduled run tries again. A manual run opens an issue only if you tick
+`report_failures`.
+
+**Rebuilding by hand.**
+
+```sh
+# a rebuild of the version npm calls latest (new release id, same harness)
+gh workflow run build-runtime.yml --repo sorsama/dsh-mobile-runtime -f rebuild=true
+# a specific harness version
+gh workflow run build-runtime.yml --repo sorsama/dsh-mobile-runtime -f harness_version=0.2.2-rc.1 -f rebuild=true
+# everything except publishing
+gh workflow run build-runtime.yml --repo sorsama/dsh-mobile-runtime -f dry_run=true
+```
+
+**Stopping automatic releases.** Set the repository variable `RUNTIME_AUTO_RELEASE` to `off`:
+
+```sh
+gh variable set RUNTIME_AUTO_RELEASE --body off --repo sorsama/dsh-mobile-runtime
+gh variable delete RUNTIME_AUTO_RELEASE --repo sorsama/dsh-mobile-runtime   # back on
+```
+
+While it is `off` the scheduled run starts, says so in its summary and ends; manual runs still
+work. `gh workflow disable build-runtime.yml` stops the schedule too, but also stops manual
+runs. GitHub itself pauses scheduled workflows of a public repository after 60 days without
+repository activity; if that happens, enable the workflow again in the Actions tab.
+
+**Going back (rollback).** Every manifest after the first can carry the optional field
+`previous`, which points at the release before it:
+
+```json
+"previous": {
+  "releaseId": "2026.11.14-3",
+  "harnessVersion": "0.2.2-rc.1",
+  "sequence": 1794682933,
+  "manifestUrl": "https://github.com/sorsama/dsh-mobile-runtime/releases/download/2026.11.14-3/manifest.json"
+}
+```
+
+To offer "go back to the previous version", the app fetches `manifestUrl` and the signature next
+to it (`manifest.json.sig` in the same directory), verifies it with the same pinned key, and
+then follows the normal install steps for that manifest. It does this only when the user asks.
+A lower `sequence` is acceptable only for this user-chosen rollback. An automatic update must
+never install a manifest whose `sequence` is lower than the installed one. The `previous`
+manifest may itself have a `previous`, so the app can walk back further; a rebuild has the same
+harness version as the release before it, so look for the first one with another
+`harnessVersion` if that is what the user wants. After a rollback the installed `sequence` is
+the old, lower one. The app should remember that the user chose it, and skip the release it
+rolled back from; it may update automatically again once a release newer than that one
+appears.
+
 ## Manifest schema (version 1)
 
 `manifest.json` is UTF-8 JSON. Unknown fields must be ignored.
@@ -98,7 +203,7 @@ unless the app moves it across).
 |---|---|---|
 | `schemaVersion` | int | `1`. Refuse a manifest with a higher major schema you do not know. |
 | `releaseId` | string | The release tag, for example `2026.11.14-1`. |
-| `sequence` | int | Increases with every release (Unix time of the build). Never install a manifest whose `sequence` is lower than the installed one. |
+| `sequence` | int | Increases with every release (Unix time of the build, and always above the previous release's). An automatic update never installs a manifest whose `sequence` is lower than the installed one. The only exception is a rollback the user asked for (see `previous`). |
 | `createdAt` | string | ISO 8601 UTC time of the build. |
 | `minAppVersion` | string | Lowest DSH Mobile `versionName` (semver) that may install this release. |
 | `signing.algorithm` | string | `Ed25519`. |
@@ -117,6 +222,7 @@ unless the app moves it across).
 | `runtime.fakeProc[]` | array of `{source, target}` | Files to bind over `/proc` entries (see "Running"). Paths are inside the guest. |
 | `runtime.resolvConf` | string | `/etc/resolv.conf`, the file the app should rewrite with the device DNS servers. |
 | `runtime.startup` | object, optional | Describes the start-up work in the harness layer. `startup.modulePack` has `enabledByDefault` (true), `disableEnv` (`DSH_RUNTIME_MODULE_PACK`), `disableValue` (`0`), `directory`, `buildIdFile`, `mechanism` and `validatedNodeVersion`. For information only: the app needs no change. |
+| `previous` | object, optional | The release before this one, so the app can offer "go back to the previous version". Absent in the first release. `previous.releaseId`, `previous.harnessVersion` (string), `previous.sequence` (int) and `previous.manifestUrl` (string, the URL of that release's `manifest.json`; its signature is `manifest.json.sig` in the same directory). The app fetches that manifest, verifies its signature with the same pinned key and installs it only on an explicit user action. See "How updates reach the app". |
 | `archs` | object | Keyed by Android ABI (`arm64-v8a`, `x86_64`). |
 | `archs.<abi>.debianArch` | string | `arm64` or `amd64`. |
 | `archs.<abi>.proot[]` | array of file | The two proot binaries, each with `installAs` (`libproot.so`, `libproot-loader.so`). |
@@ -163,7 +269,9 @@ Procedure for the app:
    Bouncy Castle (`Ed25519Signer`) or Tink (`Ed25519Verify`) with the raw key.
 4. Parse the JSON. Check `schemaVersion`, `minAppVersion` against the app's version, that
    `sequence` is not lower than the installed one, and that `archs` has the device's ABI
-   (`Build.SUPPORTED_ABIS`, first match).
+   (`Build.SUPPORTED_ABIS`, first match). The `sequence` check is for automatic updates. For a
+   rollback the user asked for (the manifest came from `previous.manifestUrl` of the installed
+   release), a lower `sequence` is accepted; do all other checks the same way.
 5. Download each needed layer from `assetBaseUrl + file`. Check the byte count against `size`
    and the SHA-256 against `sha256` before decompressing. Delete the file on any mismatch.
 
@@ -391,26 +499,33 @@ Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/bui
    signature against the committed public key), writes `SHA256SUMS.txt`, and the job creates
    the GitHub release. Before writing the manifest, the assembler downloads the manifest of
    the previous published release and fails the build if any layer has the same `id` as the
-   same layer there but a different `sha256`.
+   same layer there but a different `sha256`. It also writes the optional `previous` field,
+   keeps `sequence` above the previous one, and puts what changed (harness, Node.js, base) and
+   the per-architecture download sizes into the release notes. The job then downloads the
+   published release without a token and verifies it again.
 
 Pinned inputs live in [`scripts/versions.env`](scripts/versions.env). Tar files are built
 with sorted names, fixed owners and fixed times, so unchanged inputs give the same tar content.
 
 ## Cutting a release
 
-From the Actions tab, run **Build runtime**, or:
+Releases normally happen by themselves (see "How updates reach the app"). To start one by hand,
+run **Build runtime** from the Actions tab, or:
 
 ```sh
 gh workflow run build-runtime.yml --repo sorsama/dsh-mobile-runtime \
-  -f harness_version=latest -f release_id=2026.11.14-1 -f min_app_version=0.22.0
+  -f harness_version=latest -f rebuild=true -f min_app_version=0.22.0
 ```
 
 | Input | Default | Meaning |
 |---|---|---|
 | `harness_version` | `latest` | npm version or dist-tag of `@deepseek-ai/dsh`; resolved to an exact version. |
-| `release_id` | UTC date and run number | The release tag. Must not exist yet. |
-| `min_app_version` | `0.22.0` | Written to the manifest. |
-| `dry_run` | `false` | Build and check everything, sign the manifest, but publish nothing. The manifest is kept as a workflow artifact. |
+| `rebuild` | `false` | Build even if a release already carries that harness version. Without it, a run for a version that already has a release ends quietly. |
+| `release_id` | UTC date and next free number of that day | The release tag. Must not exist yet. |
+| `min_app_version` | empty (same as the previous release, else `0.22.0`) | Written to the manifest. |
+| `dry_run` | `false` | Build and check everything, sign the manifest, but publish nothing. The manifest is kept as a workflow artifact. Needs no `rebuild`. |
+| `report_failures` | `false` | Open or update the failure issue if this run fails (scheduled runs always do). |
+| `simulate_failure` | `none` | Test only. `early` fails before any build job, `late` fails after signing, just before publishing. |
 
 To change Debian, Node.js, proot or talloc, edit `scripts/versions.env` (bump
 `BASE_REVISION` when the base recipe changes without a version change).

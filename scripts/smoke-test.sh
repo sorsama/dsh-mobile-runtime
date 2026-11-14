@@ -34,6 +34,24 @@ secs() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", b - a }'; }
 redact() { sed -E 's/token=[A-Za-z0-9._~%-]+/token=<redacted>/g; s/(dsh-auth-[^=;]*=)[^;[:space:]]+/\1<redacted>/g'; }
 median3() { printf '%s\n' "$@" | sort -n | sed -n 2p; }
 
+# On any failure, say whether the harness's Node.js requirement (engines.node) is met by the
+# bundled Node.js. A harness that needs a newer Node.js is the usual reason a bundle does not start.
+node_hint() {
+  local rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  local engines bundled
+  engines=$(jq -r '.engines.node // ""' "$R/opt/dsh/node_modules/@deepseek-ai/dsh/package.json" 2>/dev/null || true)
+  bundled=$(jq -r '.nodeVersion // ""' "$R/opt/dsh-runtime/base.json" 2>/dev/null || true)
+  [ -n "$bundled" ] || return 0
+  local msg="Node.js check: harness asks for '${engines:-nothing}', bundle ships Node $bundled."
+  if command -v node >/dev/null 2>&1; then
+    msg=$(node "$HERE/node-engine.mjs" explain "$engines" "$bundled" 2>/dev/null || echo "$msg")
+  fi
+  echo "::error title=Smoke test failed::$msg See the log above for the step that failed."
+  echo "$msg" >&2
+}
+trap node_hint EXIT
+
 t=$(now)
 zstd -dc --long=27 "$LAYERS/dsh-runtime-base-$ABI.tar.zst" | tar -xf - -C "$R"
 zstd -dc --long=27 "$LAYERS/dsh-runtime-harness-$ABI.tar.zst" | tar -xf - -C "$R"

@@ -3,7 +3,12 @@
 and the release notes. Signing and SHA256SUMS.txt happen afterwards (sign-manifest.sh).
 
 Usage: assemble-release.py --artifacts DIR --out DIR --release-id ID --min-app-version V
-                           --repo OWNER/NAME --key-id HEX [--sequence N]
+                           --repo OWNER/NAME --key-id HEX [--sequence N] [--previous-manifest FILE]
+
+With --previous-manifest (the manifest.json of the previous published release) the assembler also
+checks that no layer id was reused for different content, keeps `sequence` above the previous one,
+writes the optional manifest field `previous`, and adds what changed and the update download sizes
+to the release notes.
 """
 import argparse
 import datetime
@@ -69,6 +74,65 @@ def mib(n):
     return f"{n / 1048576:.1f} MiB"
 
 
+def same_layer(old, new):
+    """A layer counts as installed only if both id and sha256 match (see README, "Layers and updates")."""
+    return old is not None and old["id"] == new["id"] and old["sha256"] == new["sha256"]
+
+
+def change_notes(prev, manifest, archs):
+    """The "what changed" and "download sizes" parts of the release notes, from the previous manifest."""
+    cur = manifest
+    lines = []
+    if prev is None:
+        lines += ["## What changed", "",
+                  "This is the first release in this repository, so there is nothing to compare with.", ""]
+    else:
+        pid = prev["releaseId"]
+        h0, h1 = prev["harness"]["version"], cur["harness"]["version"]
+        n0, n1 = prev["node"]["version"], cur["node"]["version"]
+        lines += [f"## What changed since `{pid}`", ""]
+        lines.append(f"- DeepSeek Harness: {h0} to {h1}." if h0 != h1
+                     else f"- DeepSeek Harness: stays at {h1}. This release is a rebuild, not a new harness version.")
+        lines.append(f"- Node.js: {n0} to {n1}." if n0 != n1 else f"- Node.js: unchanged at {n1}.")
+        base_changed = {abi: not same_layer(next((l for l in prev.get("archs", {}).get(abi, {}).get("layers", [])
+                                                  if l["name"] == "base"), None),
+                                            next(l for l in archs[abi]["layers"] if l["name"] == "base"))
+                        for abi in ABIS}
+        if any(base_changed.values()):
+            why = []
+            if n0 != n1:
+                why.append(f"Node.js {n0} to {n1}")
+            s0, s1 = prev["debian"]["snapshot"], cur["debian"]["snapshot"]
+            if s0 != s1:
+                why.append(f"Debian snapshot {s0} to {s1}")
+            lines.append("- Base layer (Debian and Node.js): changed" + (f" ({', '.join(why)})." if why else
+                         " (rebuilt with the same versions, so the archive bytes differ)."))
+        else:
+            lines.append("- Base layer (Debian and Node.js): unchanged. Apps that already have it do not download it again.")
+        p0, p1 = prev["proot"]["commit"], cur["proot"]["commit"]
+        lines.append(f"- proot: {p0[:12]} to {p1[:12]}." if p0 != p1 else f"- proot: unchanged ({p1[:12]}).")
+        lines += [f"- Rollback: the manifest's `previous` field points at `{pid}` (harness {h0}). "
+                  "An app may install it only when the user asks for it.", ""]
+    lines += ["## Download sizes", "",
+              "What the app downloads (the proot files ship inside the app itself).", ""]
+    if prev is None:
+        lines += ["| Architecture | Base layer | Harness layer | First install |", "|---|---|---|---|"]
+    else:
+        lines += [f"| Architecture | Base layer | Harness layer | First install | Update from `{prev['releaseId']}` |",
+                  "|---|---|---|---|---|"]
+    for abi in ABIS:
+        by = {l["name"]: l for l in archs[abi]["layers"]}
+        total = by["base"]["size"] + by["harness"]["size"]
+        row = f"| {abi} | {mib(by['base']['size'])} | {mib(by['harness']['size'])} | {mib(total)} |"
+        if prev is not None:
+            old = {l["name"]: l for l in prev.get("archs", {}).get(abi, {}).get("layers", [])}
+            upd = sum(l["size"] for l in archs[abi]["layers"] if not same_layer(old.get(l["name"]), l))
+            row += f" {mib(upd)} |" if upd else " nothing |"
+        lines.append(row)
+    lines.append("")
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     for opt in ("--artifacts", "--out", "--release-id", "--min-app-version", "--repo", "--key-id"):
@@ -130,11 +194,20 @@ def main():
             assert layer_docs[abi][k] == v, f"{abi} has a different {k}"
 
     check_against_previous(archs, a.previous_manifest)
+    prev = json.load(open(a.previous_manifest)) if a.previous_manifest and os.path.exists(a.previous_manifest) else None
+
+    # The sequence must keep increasing, also for several releases within one second of the
+    # clock (or a clock that is behind): never at or below the previous release.
+    sequence = a.sequence or int(now.timestamp())
+    if prev is not None and sequence <= prev["sequence"]:
+        if a.sequence:
+            raise SystemExit(f"--sequence {a.sequence} is not above the previous release's {prev['sequence']}")
+        sequence = prev["sequence"] + 1
 
     manifest = {
         "schemaVersion": 1,
         "releaseId": a.release_id,
-        "sequence": a.sequence or int(now.timestamp()),
+        "sequence": sequence,
         "createdAt": now.isoformat().replace("+00:00", "Z"),
         "minAppVersion": a.min_app_version,
         "signing": {"algorithm": "Ed25519", "keyId": a.key_id, "signatureFile": "manifest.json.sig"},
@@ -168,6 +241,16 @@ def main():
         },
         "archs": archs,
     }
+    if prev is not None:
+        # Optional. Lets an app offer "go back to the previous version": fetch manifestUrl,
+        # check its signature (manifest.json.sig next to it) with the same pinned key, and
+        # install it only on an explicit user action. See the README.
+        manifest["previous"] = {
+            "releaseId": prev["releaseId"],
+            "harnessVersion": prev["harness"]["version"],
+            "sequence": prev["sequence"],
+            "manifestUrl": f"https://github.com/{a.repo}/releases/download/{prev['releaseId']}/manifest.json",
+        }
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
@@ -176,6 +259,9 @@ def main():
     lines = [
         f"DSH Mobile runtime bundle `{a.release_id}`.",
         "",
+    ] + change_notes(prev, manifest, archs) + [
+        "## Versions",
+        "",
         "| Component | Version |",
         "|---|---|",
         f"| DeepSeek Harness (`@deepseek-ai/dsh`) | {harness_version} |",
@@ -183,6 +269,8 @@ def main():
         f"| Debian | {pins['DEBIAN_SUITE']}, snapshot {snapshot} |",
         f"| proot | {pins['PROOT_VERSION']} ([`{pins['PROOT_COMMIT'][:12]}`]({pins['PROOT_REPO']}/tree/{pins['PROOT_COMMIT']})), talloc {pins['TALLOC_VERSION']} static, NDK {pins['NDK_VERSION']} |",
         f"| Minimum app version | {a.min_app_version} |",
+        "",
+        "## Layers and checks",
         "",
         "| Architecture | Layer | File | Compressed | Unpacked | Entries |",
         "|---|---|---|---|---|---|",

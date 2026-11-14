@@ -1,30 +1,48 @@
 name: Build runtime
 
 on:
+  schedule:
+    # Every 6 hours. Checks npm and does nothing unless @deepseek-ai/dsh has a new version.
+    - cron: "17 */6 * * *"
   workflow_dispatch:
     inputs:
       harness_version:
-        description: "@deepseek-ai/dsh version or npm dist-tag"
-        required: true
+        description: "@deepseek-ai/dsh version or npm dist-tag (default latest)"
+        required: false
         default: latest
+      rebuild:
+        description: "Build even if a release already carries this harness version"
+        type: boolean
+        default: false
       release_id:
-        description: "Release tag (empty: UTC date plus run number, for example 2026.11.14-7)"
+        description: "Release tag (empty: UTC date plus the next free number that day, for example 2026.11.14-7)"
         required: false
         default: ""
       min_app_version:
-        description: "Lowest DSH Mobile versionName that may install this bundle"
-        required: true
-        default: "0.22.0"
+        description: "Lowest DSH Mobile versionName that may install this bundle (empty: same as the previous release)"
+        required: false
+        default: ""
       dry_run:
         description: "Build and check everything, but do not publish a release"
         type: boolean
         default: false
+      report_failures:
+        description: "Open or update a GitHub issue if this build fails (scheduled runs always do)"
+        type: boolean
+        default: false
+      simulate_failure:
+        description: "Test only: fail on purpose (early: before any build job, late: after signing, just before publishing)"
+        type: choice
+        options: [none, early, late]
+        default: none
 
 permissions:
   contents: read
 
+# One run at a time for the whole workflow: a check, a build and a publish never overlap,
+# so two runs can never build the same version at once. Queued runs wait, they are not cancelled.
 concurrency:
-  group: build-runtime
+  group: runtime-release
   cancel-in-progress: false
 
 defaults:
@@ -33,38 +51,37 @@ defaults:
 
 jobs:
   prepare:
-    name: Resolve versions
+    name: Check npm and plan
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      harness_version: ${{ steps.v.outputs.harness_version }}
-      release_id: ${{ steps.v.outputs.release_id }}
+      build: ${{ steps.plan.outputs.build }}
+      harness_version: ${{ steps.plan.outputs.harness_version }}
+      release_id: ${{ steps.plan.outputs.release_id }}
+      min_app_version: ${{ steps.plan.outputs.min_app_version }}
+      node_version: ${{ steps.plan.outputs.node_version }}
+      previous_tag: ${{ steps.plan.outputs.previous_tag }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - id: v
+      - id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
           HARNESS_INPUT: ${{ inputs.harness_version }}
           RELEASE_INPUT: ${{ inputs.release_id }}
+          MIN_APP_INPUT: ${{ inputs.min_app_version }}
+          REBUILD: ${{ inputs.rebuild }}
           DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          set -euo pipefail
-          V=$(npm view "@deepseek-ai/dsh@$HARNESS_INPUT" version --json | jq -r 'if type == "array" then .[-1] else . end')
-          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || { echo "could not resolve '$HARNESS_INPUT' (got '$V')"; exit 1; }
-          RID=${RELEASE_INPUT:-$(date -u +%Y.%m.%d)-$GITHUB_RUN_NUMBER}
-          [[ "$RID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "bad release id '$RID'"; exit 1; }
-          if [ "$DRY_RUN" != true ] && gh release view "$RID" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "release $RID already exists"; exit 1
-          fi
-          echo "harness_version=$V" >> "$GITHUB_OUTPUT"
-          echo "release_id=$RID" >> "$GITHUB_OUTPUT"
-          { echo "### Inputs"; echo "- harness: \`@deepseek-ai/dsh@$V\` (from \`$HARNESS_INPUT\`)"; echo "- release: \`$RID\`"; echo "- dry run: $DRY_RUN"; } >> "$GITHUB_STEP_SUMMARY"
+          SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
+          AUTO_RELEASE: ${{ vars.RUNTIME_AUTO_RELEASE }}
+        run: bash scripts/plan-release.sh
 
   proot-android:
     name: proot for Android
     needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -116,6 +133,7 @@ jobs:
   layers:
     name: Layers ${{ matrix.abi }}
     needs: prepare
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
     strategy:
@@ -130,6 +148,8 @@ jobs:
       ABI: ${{ matrix.abi }}
       HARNESS_VERSION: ${{ needs.prepare.outputs.harness_version }}
       RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+      # The pinned Node.js, or a newer 24.x when the harness asks for one (see scripts/node-engine.mjs).
+      NODE_VERSION: ${{ needs.prepare.outputs.node_version }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -153,7 +173,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/layers-work"
           docker run --rm --privileged \
             -v "$PWD:/src" -v "$RUNNER_TEMP/layers-work:/work" -w /src \
-            -e HARNESS_VERSION -e RELEASE_ID \
+            -e HARNESS_VERSION -e RELEASE_ID -e NODE_VERSION \
             debian:trixie bash scripts/build-layers.sh "$ABI" "out/layers-$ABI"
           sudo chown -R "$(id -u):$(id -g)" out
           sudo rm -rf "$RUNNER_TEMP/layers-work"
@@ -199,6 +219,7 @@ jobs:
   release:
     name: Manifest and release
     needs: [prepare, proot-android, layers]
+    if: needs.prepare.outputs.build == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     permissions:
@@ -214,20 +235,22 @@ jobs:
           path: artifacts
       - name: Assemble manifest
         env:
-          MIN_APP_VERSION: ${{ inputs.min_app_version }}
+          MIN_APP_VERSION: ${{ needs.prepare.outputs.min_app_version }}
+          PREV_TAG: ${{ needs.prepare.outputs.previous_tag }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ls -laR artifacts
           KEY_ID=$(openssl pkey -pubin -in keys/runtime-signing-ed25519.pub.pem -outform DER | tail -c 32 | sha256sum | cut -c1-16)
-          # Previous published release (if any): layer ids must not be reused for different content.
+          # Previous published release (if any): layer ids must not be reused for different content,
+          # and the new manifest points back at it. Its manifest must verify against the pinned key.
           PREV=""
-          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')
           if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$RELEASE_ID" ]; then
             mkdir -p previous
-            gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir previous
+            gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --pattern manifest.json.sig --dir previous --clobber
+            bash scripts/verify-manifest.sh previous/manifest.json previous/manifest.json.sig
             PREV=previous/manifest.json
-            echo "previous release: $PREV_TAG"
+            echo "previous release: $PREV_TAG (signature verified)"
           fi
           python3 scripts/assemble-release.py --artifacts artifacts --out release --release-id "$RELEASE_ID" \
             --min-app-version "$MIN_APP_VERSION" --repo "$GITHUB_REPOSITORY" --key-id "$KEY_ID" \
@@ -248,6 +271,11 @@ jobs:
             release/manifest.json.sig
             release/SHA256SUMS.txt
             release/release-notes.md
+      - name: Simulated failure (test only)
+        if: ${{ inputs.simulate_failure == 'late' }}
+        run: |
+          echo "::error title=Simulated failure::simulate_failure=late: every check passed and the manifest is signed; stopping before the release is created, on purpose."
+          exit 1
       - name: Publish GitHub release
         if: ${{ !inputs.dry_run }}
         env:
@@ -259,3 +287,125 @@ jobs:
             --title "Runtime $RELEASE_ID" --notes-file release/release-notes.md \
             release/!(release-notes.md)
           gh release view "$RELEASE_ID" --repo "$GITHUB_REPOSITORY" --json url,assets --jq '.url, (.assets[] | "\(.name) \(.size)")'
+      - name: Verify the published release from outside
+        # Downloads the release like an app would, without a token. A release that does not
+        # verify is deleted again, so a broken bundle never stays the latest one.
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          HERE=$PWD/scripts
+          W=$(mktemp -d)
+          cleanup() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::error title=Published release did not verify::deleting release $RELEASE_ID and its tag"
+              gh release delete "$RELEASE_ID" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+            fi
+            rm -rf "$W"
+          }
+          trap cleanup EXIT
+          cd "$W"
+          BASE="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_ID"
+          get() { curl -fsSL --retry 6 --retry-delay 5 --retry-all-errors -o "$2" "$1"; }
+          get "$BASE/manifest.json" manifest.json
+          get "$BASE/manifest.json.sig" manifest.json.sig
+          get "$BASE/SHA256SUMS.txt" SHA256SUMS.txt
+          bash "$HERE/verify-manifest.sh" manifest.json manifest.json.sig
+          [ "$(jq -r .releaseId manifest.json)" = "$RELEASE_ID" ] || { echo "manifest has another releaseId"; exit 1; }
+          awk '{print $2}' SHA256SUMS.txt | sed 's/^\*//' | while read -r f; do
+            case "$f" in manifest.json|manifest.json.sig) continue ;; esac
+            get "$BASE/$f" "$f"
+          done
+          sha256sum -c SHA256SUMS.txt
+          # Every file the manifest names must be in SHA256SUMS.txt with the same hash and size.
+          jq -r '[.archs[] | (.proot[], .layers[])] + .proot.sources | .[] | "\(.sha256)  \(.file) \(.size)"' manifest.json | while read -r h f size; do
+            grep -q "^$h  $f\$" SHA256SUMS.txt || { echo "$f: hash in manifest.json is not in SHA256SUMS.txt"; exit 1; }
+            [ "$(stat -c %s "$f")" = "$size" ] || { echo "$f: size differs from the manifest"; exit 1; }
+          done
+          # The pointer to the previous release must resolve to a manifest that verifies too.
+          if jq -e .previous manifest.json >/dev/null; then
+            PID=$(jq -r .previous.releaseId manifest.json); PURL=$(jq -r .previous.manifestUrl manifest.json)
+            mkdir prev
+            get "$PURL" prev/manifest.json
+            get "${PURL%manifest.json}manifest.json.sig" prev/manifest.json.sig
+            bash "$HERE/verify-manifest.sh" prev/manifest.json prev/manifest.json.sig
+            [ "$(jq -r .releaseId prev/manifest.json)" = "$PID" ] || { echo "previous manifest has another releaseId"; exit 1; }
+            [ "$(jq -r .harness.version prev/manifest.json)" = "$(jq -r .previous.harnessVersion manifest.json)" ] || { echo "previous harness version differs"; exit 1; }
+            [ "$(jq -r .sequence prev/manifest.json)" = "$(jq -r .previous.sequence manifest.json)" ] || { echo "previous sequence differs"; exit 1; }
+            [ "$(jq -r .sequence manifest.json)" -gt "$(jq -r .sequence prev/manifest.json)" ] || { echo "sequence did not increase"; exit 1; }
+            echo "previous release $PID resolves and verifies"
+          fi
+          echo "release $RELEASE_ID verified from outside"
+
+  report:
+    name: Issue for a failed build
+    needs: [prepare, proot-android, layers, release]
+    # Only when a build was wanted. A quiet "nothing to do" run never gets here.
+    if: ${{ !cancelled() && needs.prepare.outputs.build == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HARNESS_VERSION: ${{ needs.prepare.outputs.harness_version }}
+      RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+      RESULTS: "prepare=${{ needs.prepare.result }} proot-android=${{ needs.proot-android.result }} layers=${{ needs.layers.result }} release=${{ needs.release.result }}"
+      RELEASE_RESULT: ${{ needs.release.result }}
+      REPORT: ${{ github.event_name == 'schedule' || inputs.report_failures }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      SIMULATE_FAILURE: ${{ inputs.simulate_failure }}
+      EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Open, update or close the issue
+        run: |
+          set -euo pipefail
+          TITLE="Automatic runtime build failed for @deepseek-ai/dsh $HARNESS_VERSION"
+          LABEL=runtime-auto-release
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "results: $RESULTS"
+          open_issues() {
+            gh issue list --repo "$GITHUB_REPOSITORY" --state open --label "$LABEL" --limit 200 --json number,title \
+              | jq -r --arg t "$TITLE" '.[] | select(.title == $t) | .number'
+          }
+          if [ "$RELEASE_RESULT" = success ] && [ "$DRY_RUN" != true ]; then
+            for n in $(open_issues); do
+              gh issue comment "$n" --repo "$GITHUB_REPOSITORY" --body "Fixed: release \`$RELEASE_ID\` with harness $HARNESS_VERSION was published by [this run]($RUN_URL). Closing."
+              gh issue close "$n" --repo "$GITHUB_REPOSITORY" --reason completed
+              echo "closed issue #$n"
+            done
+            exit 0
+          fi
+          if [ "$RELEASE_RESULT" = success ]; then echo "dry run succeeded: nothing to report"; exit 0; fi
+          case "$RESULTS" in *failure*) ;; *) echo "no failed job (results: $RESULTS): nothing to report"; exit 0 ;; esac
+          if [ "$REPORT" != true ]; then echo "failure reporting is off for this run"; exit 0; fi
+          JOBS=$(gh run view "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --json jobs \
+            --jq '.jobs[] | select(.conclusion == "failure") | "- \(.name): \(.url)"')
+          NOTE=""
+          if [ -n "$SIMULATE_FAILURE" ] && [ "$SIMULATE_FAILURE" != none ]; then
+            NOTE="
+
+          This failure was simulated on purpose (simulate_failure=$SIMULATE_FAILURE)."
+          fi
+          BODY="The runtime build for \`@deepseek-ai/dsh@$HARNESS_VERSION\` (release id \`$RELEASE_ID\`) failed. **Nothing was published**; apps keep the current release.
+
+          Run: $RUN_URL (trigger: $EVENT_NAME)
+
+          Failed jobs:
+          $JOBS$NOTE
+
+          The next scheduled run tries again. This issue closes itself when a release with this harness version is published."
+          gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" --color B60205 \
+            --description "Automatic runtime release failed" 2>/dev/null || true
+          EXISTING=$(open_issues | head -1)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" \
+              --body "Failed again. Run: $RUN_URL (trigger: $EVENT_NAME)"$'\n\n'"Failed jobs:"$'\n'"$JOBS$NOTE"
+            echo "updated issue #$EXISTING"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --label "$LABEL" --body "$BODY"
+          fi
