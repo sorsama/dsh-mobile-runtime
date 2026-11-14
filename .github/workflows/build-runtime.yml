@@ -215,12 +215,23 @@ jobs:
       - name: Assemble manifest
         env:
           MIN_APP_VERSION: ${{ inputs.min_app_version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ls -laR artifacts
           KEY_ID=$(openssl pkey -pubin -in keys/runtime-signing-ed25519.pub.pem -outform DER | tail -c 32 | sha256sum | cut -c1-16)
+          # Previous published release (if any): layer ids must not be reused for different content.
+          PREV=""
+          PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""')
+          if [ -n "$PREV_TAG" ] && [ "$PREV_TAG" != "$RELEASE_ID" ]; then
+            mkdir -p previous
+            gh release download "$PREV_TAG" --repo "$GITHUB_REPOSITORY" --pattern manifest.json --dir previous
+            PREV=previous/manifest.json
+            echo "previous release: $PREV_TAG"
+          fi
           python3 scripts/assemble-release.py --artifacts artifacts --out release --release-id "$RELEASE_ID" \
-            --min-app-version "$MIN_APP_VERSION" --repo "$GITHUB_REPOSITORY" --key-id "$KEY_ID"
+            --min-app-version "$MIN_APP_VERSION" --repo "$GITHUB_REPOSITORY" --key-id "$KEY_ID" \
+            ${PREV:+--previous-manifest "$PREV"}
       - name: Sign manifest
         env:
           RUNTIME_SIGNING_KEY: ${{ secrets.RUNTIME_SIGNING_KEY }}

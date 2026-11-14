@@ -66,12 +66,25 @@ works inside the runtime.
 The two layers are separate files so a harness update does not download Debian and Node again.
 
 - **base** owns the whole tree except the harness paths (`excludes`: `/opt/dsh`,
-  `/usr/local/bin/dsh`). Its `id` (for example `trixie-20261110T000000Z-node24.22.3-r1`) only
-  changes when the Debian snapshot, the Node.js version or the base recipe changes.
-- **harness** owns `/opt/dsh` and `/usr/local/bin/dsh`. Its `id` is `dsh-<version>`.
+  `/usr/local/bin/dsh`).
+- **harness** owns `/opt/dsh` and `/usr/local/bin/dsh`.
 
-Update rule for the app: for each layer, compare the manifest's `id` with the one installed.
-If only the harness changed, delete `/opt/dsh` and `/usr/local/bin/dsh` and unpack the new
+A layer `id` is a readable part, a dash, and the first 12 hex digits of the SHA-256 of the
+layer archive (the same value as `sha256`, truncated):
+
+- base: `trixie-<snapshot>-node<version>-r<revision>-<hash12>`, for example
+  `trixie-20261110T000000Z-node24.22.3-r1-0123456789ab`
+- harness: `dsh-<harness version>-<hash12>`, for example `dsh-0.2.2-rc.1-0123456789ab`
+
+So the id changes whenever the archive changes, even when the readable part stays the same
+(for example a rebuilt harness layer with the same npm version). Two builds that produce
+byte-identical archives get the same id, so an unchanged base layer is not downloaded again.
+`debian.baseId` is only the readable part of the base id, without the hash.
+
+Update rule for the app: a layer counts as already installed only if **both** its `id` and its
+`sha256` equal the values of the installed layer. If either differs, download it. (Releases
+before `2026.11.14-3` used only the readable part as the id and reused it for changed
+content, so never trust the id alone.) If only the harness changed, delete `/opt/dsh` and `/usr/local/bin/dsh` and unpack the new
 harness layer over the existing tree. If the base changed, unpack the base into a new staging
 directory, unpack the harness on top, then swap directories. User data should not live inside
 the layers' paths (the harness keeps its state under `/root`; a base update replaces `/root`
@@ -95,7 +108,7 @@ unless the app moves it across).
 | `harness.package`, `harness.version` | string | `@deepseek-ai/dsh` and its exact npm version. |
 | `node.version`, `node.home` | string | Node.js version, and `/opt/node`. |
 | `debian.suite`, `debian.snapshot` | string | `trixie`, and the snapshot.debian.org timestamp the packages came from. |
-| `debian.baseId` | string | Same as the base layer `id`. |
+| `debian.baseId` | string | The readable part of the base layer `id`, without the hash suffix. |
 | `proot.repo`, `proot.commit`, `proot.version` | string | Source of proot (`termux/proot`). |
 | `proot.talloc`, `proot.ndk`, `proot.androidApi` | string, string, int | talloc version (linked statically), NDK version, API level of the build. |
 | `proot.sources[]` | array of file | The source tarballs published with the release. |
@@ -117,7 +130,7 @@ A **layer** is a file object plus:
 | Field | Meaning |
 |---|---|
 | `name` | `base` or `harness`. |
-| `id` | Identity of the layer content, used to decide whether it must be downloaded. |
+| `id` | Identity of the layer content: readable part plus 12 hex digits of the archive SHA-256 (see "Layers and updates"). Skip a download only if both `id` and `sha256` match the installed layer. |
 | `compression` | `zstd`. |
 | `zstdWindowLog` | `27`: the decoder needs a 128 MiB window. Standard decoders accept this without special flags. |
 | `format` | `tar (GNU)`. |
@@ -376,7 +389,9 @@ Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/bui
 5. **Release**: `scripts/assemble-release.py` writes `manifest.json` and the notes,
    `scripts/sign-manifest.sh` signs it with the `RUNTIME_SIGNING_KEY` secret (and checks the
    signature against the committed public key), writes `SHA256SUMS.txt`, and the job creates
-   the GitHub release.
+   the GitHub release. Before writing the manifest, the assembler downloads the manifest of
+   the previous published release and fails the build if any layer has the same `id` as the
+   same layer there but a different `sha256`.
 
 Pinned inputs live in [`scripts/versions.env`](scripts/versions.env). Tar files are built
 with sorted names, fixed owners and fixed times, so unchanged inputs give the same tar content.

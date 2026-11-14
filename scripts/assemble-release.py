@@ -15,6 +15,29 @@ import shutil
 HERE = os.path.dirname(os.path.abspath(__file__))
 ABIS = ["arm64-v8a", "x86_64"]
 HARNESS_PATHS = ["/opt/dsh", "/usr/local/bin/dsh"]
+ID_HASH_LEN = 12
+
+
+def check_against_previous(archs, prev_path):
+    """Fails if a layer keeps the id of the same layer in the previous release while its SHA-256 differs."""
+    if not prev_path or not os.path.exists(prev_path):
+        print("no previous manifest given: layer id check skipped")
+        return
+    prev = json.load(open(prev_path))
+    bad = []
+    for abi, arch in archs.items():
+        old = {l["name"]: l for l in prev.get("archs", {}).get(abi, {}).get("layers", [])}
+        for l in arch["layers"]:
+            o = old.get(l["name"])
+            if o is None:
+                continue
+            same_id, same_hash = o["id"] == l["id"], o["sha256"] == l["sha256"]
+            print(f"{abi} {l['name']}: previous id {o['id']}, new id {l['id']}, "
+                  f"{'identical archive' if same_hash else 'archive changed'}")
+            if same_id and not same_hash:
+                bad.append(f"{abi} {l['name']}: id {l['id']} unchanged but sha256 {o['sha256']} -> {l['sha256']}")
+    if bad:
+        raise SystemExit("layer id reused for different content:\n  " + "\n  ".join(bad))
 
 
 def env_file(path):
@@ -51,6 +74,7 @@ def main():
     for opt in ("--artifacts", "--out", "--release-id", "--min-app-version", "--repo", "--key-id"):
         ap.add_argument(opt, required=True)
     ap.add_argument("--sequence", type=int)
+    ap.add_argument("--previous-manifest", help="manifest.json of the previous published release (id reuse check)")
     a = ap.parse_args()
     pins = env_file(os.path.join(HERE, "versions.env"))
     os.makedirs(a.out, exist_ok=True)
@@ -81,7 +105,9 @@ def main():
             l = doc[name]
             entry = asset(os.path.join(d, l["file"]), a.out)
             assert entry["sha256"] == l["sha256"], f"{l['file']} changed between build and release"
-            entry.update({"name": name, "id": l["id"], "compression": "zstd", "zstdWindowLog": 27,
+            # The id changes whenever the archive changes: readable part plus the first 12 hex digits
+            # of the archive SHA-256. The same bytes always give the same id.
+            entry.update({"name": name, "id": f"{l['id']}-{entry['sha256'][:ID_HASH_LEN]}", "compression": "zstd", "zstdWindowLog": 27,
                           "format": "tar (GNU)", "unpackedSize": l["unpackedSize"], "entries": l["entries"],
                           "owns": ["/"] if name == "base" else HARNESS_PATHS})
             if name == "base":
@@ -102,6 +128,8 @@ def main():
     for abi in ABIS:
         for k, v in (("harnessVersion", harness_version), ("nodeVersion", node_version), ("debianSnapshot", snapshot)):
             assert layer_docs[abi][k] == v, f"{abi} has a different {k}"
+
+    check_against_previous(archs, a.previous_manifest)
 
     manifest = {
         "schemaVersion": 1,
