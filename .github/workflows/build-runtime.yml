@@ -76,9 +76,14 @@ jobs:
           set -euo pipefail
           . scripts/versions.env
           SDK=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          ls "$SDK/ndk" || true
           if [ ! -d "$SDK/ndk/$NDK_VERSION" ]; then
+            # yes(1) dies of SIGPIPE when sdkmanager exits; that is not an error.
+            set +o pipefail
             yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+            set -o pipefail
           fi
+          test -x "$SDK/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
           echo "ANDROID_NDK_ROOT=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
       - name: Build proot and loader (arm64-v8a, x86_64)
         run: bash scripts/build-proot-android.sh out/proot-android
