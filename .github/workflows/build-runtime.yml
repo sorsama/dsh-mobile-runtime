@@ -1,0 +1,233 @@
+name: Build runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      harness_version:
+        description: "@deepseek-ai/dsh version or npm dist-tag"
+        required: true
+        default: latest
+      release_id:
+        description: "Release tag (empty: UTC date plus run number, for example 2026.11.14-7)"
+        required: false
+        default: ""
+      min_app_version:
+        description: "Lowest DSH Mobile versionName that may install this bundle"
+        required: true
+        default: "0.22.0"
+      dry_run:
+        description: "Build and check everything, but do not publish a release"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-runtime
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    name: Resolve versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      harness_version: ${{ steps.v.outputs.harness_version }}
+      release_id: ${{ steps.v.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HARNESS_INPUT: ${{ inputs.harness_version }}
+          RELEASE_INPUT: ${{ inputs.release_id }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          V=$(npm view "@deepseek-ai/dsh@$HARNESS_INPUT" version --json | jq -r 'if type == "array" then .[-1] else . end')
+          [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || { echo "could not resolve '$HARNESS_INPUT' (got '$V')"; exit 1; }
+          RID=${RELEASE_INPUT:-$(date -u +%Y.%m.%d)-$GITHUB_RUN_NUMBER}
+          [[ "$RID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "bad release id '$RID'"; exit 1; }
+          if [ "$DRY_RUN" != true ] && gh release view "$RID" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $RID already exists"; exit 1
+          fi
+          echo "harness_version=$V" >> "$GITHUB_OUTPUT"
+          echo "release_id=$RID" >> "$GITHUB_OUTPUT"
+          { echo "### Inputs"; echo "- harness: \`@deepseek-ai/dsh@$V\` (from \`$HARNESS_INPUT\`)"; echo "- release: \`$RID\`"; echo "- dry run: $DRY_RUN"; } >> "$GITHUB_STEP_SUMMARY"
+
+  proot-android:
+    name: proot for Android
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Android NDK
+        run: |
+          set -euo pipefail
+          . scripts/versions.env
+          SDK=${ANDROID_SDK_ROOT:-$ANDROID_HOME}
+          if [ ! -d "$SDK/ndk/$NDK_VERSION" ]; then
+            yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          fi
+          echo "ANDROID_NDK_ROOT=$SDK/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+      - name: Build proot and loader (arm64-v8a, x86_64)
+        run: bash scripts/build-proot-android.sh out/proot-android
+      - name: Check 16 KB alignment
+        run: |
+          set -euo pipefail
+          O=out/proot-android
+          python3 scripts/check-elf-alignment.py --machine aarch64 --min 16384 --strict --json "$RUNNER_TEMP/a64.json" \
+            $O/android-arm64-v8a-libproot.so $O/android-arm64-v8a-libproot-loader.so
+          python3 scripts/check-elf-alignment.py --machine x86_64 --min 16384 --strict --json "$RUNNER_TEMP/x64.json" \
+            $O/android-x86_64-libproot.so $O/android-x86_64-libproot-loader.so
+          for f in $O/*.so; do echo "== $f"; readelf -lW "$f" | grep -E 'LOAD|GNU_STACK'; done
+          python3 - "$RUNNER_TEMP/a64.json" "$RUNNER_TEMP/x64.json" "$O/proot-android.json" <<'EOF'
+          import json, sys
+          a, b = json.load(open(sys.argv[1])), json.load(open(sys.argv[2]))
+          assert a["checked"] == 2 and b["checked"] == 2, "expected two ELF files per ABI"
+          n, t = a["aligned"] + b["aligned"], a["checked"] + b["checked"]
+          json.dump({"alignmentSummary": f"{n} of {t} files aligned to 16 KB or more",
+                     "histogram": {"arm64-v8a": a["histogram"], "x86_64": b["histogram"]}},
+                    open(sys.argv[3], "w"), indent=2)
+          EOF
+          cat $O/proot-android.json
+          sha256sum $O/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: proot-android
+          path: out/proot-android
+          if-no-files-found: error
+
+  layers:
+    name: Layers ${{ matrix.abi }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - abi: arm64-v8a
+            runner: ubuntu-24.04-arm
+          - abi: x86_64
+            runner: ubuntu-24.04
+    env:
+      ABI: ${{ matrix.abi }}
+      HARNESS_VERSION: ${{ needs.prepare.outputs.harness_version }}
+      RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Disk space
+        run: |
+          df -h / "$RUNNER_TEMP"
+          avail=$(df --output=avail -k / | tail -1)
+          if [ "$avail" -lt 25000000 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+            df -h /
+          fi
+      - name: Linux proot for the smoke test (same commit)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libtalloc-dev zstd > /dev/null
+          bash scripts/build-proot-linux.sh "$RUNNER_TEMP/proot-linux"
+      - name: Build base and harness layers
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/layers-work"
+          docker run --rm --privileged \
+            -v "$PWD:/src" -v "$RUNNER_TEMP/layers-work:/work" -w /src \
+            -e HARNESS_VERSION -e RELEASE_ID \
+            debian:trixie bash scripts/build-layers.sh "$ABI" "out/layers-$ABI"
+          sudo chown -R "$(id -u):$(id -g)" out
+          sudo rm -rf "$RUNNER_TEMP/layers-work"
+      - name: Smoke test under proot
+        run: |
+          WORK="$RUNNER_TEMP/smoke" bash scripts/smoke-test.sh "$ABI" "out/layers-$ABI" "$RUNNER_TEMP/proot-linux" \
+            "out/layers-$ABI/smoke-$ABI.json"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### $ABI"
+            [ -f "out/layers-$ABI/layers-$ABI.json" ] && { echo '```json'; jq '{base: (.base | del(.stats)), harness: (.harness | del(.stats)), prune, alignment}' "out/layers-$ABI/layers-$ABI.json"; echo '```'; }
+            [ -f "out/layers-$ABI/smoke-$ABI.json" ] && { echo '```json'; cat "out/layers-$ABI/smoke-$ABI.json"; echo '```'; }
+          } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: layers-${{ matrix.abi }}
+          path: out/layers-${{ matrix.abi }}
+          compression-level: 0
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: smoke-logs-${{ matrix.abi }}
+          path: |
+            ${{ runner.temp }}/smoke/guest-checks.txt
+            ${{ runner.temp }}/smoke/harness-redacted.log
+          if-no-files-found: ignore
+
+  release:
+    name: Manifest and release
+    needs: [prepare, proot-android, layers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      RELEASE_ID: ${{ needs.prepare.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Assemble manifest
+        env:
+          MIN_APP_VERSION: ${{ inputs.min_app_version }}
+        run: |
+          set -euo pipefail
+          ls -laR artifacts
+          KEY_ID=$(openssl pkey -pubin -in keys/runtime-signing-ed25519.pub.pem -outform DER | tail -c 32 | sha256sum | cut -c1-16)
+          python3 scripts/assemble-release.py --artifacts artifacts --out release --release-id "$RELEASE_ID" \
+            --min-app-version "$MIN_APP_VERSION" --repo "$GITHUB_REPOSITORY" --key-id "$KEY_ID"
+      - name: Sign manifest
+        env:
+          RUNTIME_SIGNING_KEY: ${{ secrets.RUNTIME_SIGNING_KEY }}
+        run: bash scripts/sign-manifest.sh release
+      - name: Summary
+        run: |
+          cat release/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+          ls -la release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-metadata
+          path: |
+            release/manifest.json
+            release/manifest.json.sig
+            release/SHA256SUMS.txt
+            release/release-notes.md
+      - name: Publish GitHub release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s extglob
+          gh release create "$RELEASE_ID" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Runtime $RELEASE_ID" --notes-file release/release-notes.md \
+            release/!(release-notes.md)
+          gh release view "$RELEASE_ID" --repo "$GITHUB_REPOSITORY" --json url,assets --jq '.url, (.assets[] | "\(.name) \(.size)")'

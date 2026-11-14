@@ -1,0 +1,10 @@
+work/
+out/
+artifacts/
+release/
+*.tar
+*.tar.zst
+*.tar.gz
+*.so
+*.key.pem
+*private*
