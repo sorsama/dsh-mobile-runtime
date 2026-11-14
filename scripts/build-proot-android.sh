@@ -73,8 +73,11 @@ for abi in arm64-v8a x86_64; do
   # Environment flags: the GNUmakefile appends to them with +=.
   # GIT=false keeps the version string from picking up this repo's git tags.
   # HAS_LOADER_32BIT= drops the 32-bit loader (no 32-bit guests here).
+  # ashmem_memfd.c calls strcmp without <string.h>, which clang 16+ rejects by default.
+  # The call resolves to the builtin with the right type, so a warning is enough.
   env \
     CPPFLAGS="-I$B/sysroot/include -DARG_MAX=131072 -DVERSION=\\\"$PROOT_VERSION\\\"" \
+    CFLAGS="-Wno-error=implicit-function-declaration" \
     LDFLAGS="-L$B/sysroot/lib -Wl,-z,max-page-size=16384" \
     LOADER_LDFLAGS="-Wl,-z,max-page-size=16384" \
     make -C "$B/proot/src" -j"$(nproc)" V=1 \
