@@ -52,9 +52,16 @@ proot_run 'umask 022; set -e
   cd /tmp && rm -rf g && git init -q g && cd g && git config user.email ci@example.invalid && git config user.name ci \
     && echo hi > f && git add f && git commit -qm init && echo "git commit ok"
   printf "#!/usr/bin/env node\nconsole.log(\"node shebang ok\")\n" > /tmp/n.js && chmod +x /tmp/n.js && /tmp/n.js
-  rm -rf /tmp/hl /tmp/g /tmp/n.js' 2>&1 | tee "$WORK/guest-checks.txt"
+  rm -rf /tmp/g /tmp/n.js
+  # Known proot quirk: rm -rf of a directory that holds link2symlink files can fail
+  # once with "Directory not empty" (the hidden .l2s. file moves while rm reads the
+  # directory). A second rm succeeds. Report it instead of failing.
+  rm -rf /tmp/hl 2>/dev/null || { echo "note: first rm -rf of the hard link dir failed (link2symlink quirk)"; rm -rf /tmp/hl; }
+  echo "cleanup ok"' 2>&1 | tee "$WORK/guest-checks.txt"
 CPUS=$(sed -n 's/^os.cpus \([0-9]*\).*/\1/p' "$WORK/guest-checks.txt")
 [ "${CPUS:-0}" -gt 0 ] || { echo "os.cpus() is empty" >&2; exit 1; }
+RM_RETRY=$(grep -q "link2symlink quirk" "$WORK/guest-checks.txt" && echo true || echo false)
+grep -q "^cleanup ok" "$WORK/guest-checks.txt" || { echo "guest checks did not finish" >&2; exit 1; }
 
 PROOT_PID=
 start_harness() {
@@ -124,6 +131,6 @@ cat > "$RESULT" <<EOF
 {"abi": "$ABI", "runner": "$(uname -m) $(nproc) CPUs", "extractSeconds": $EXTRACT,
  "firstStartToReadySeconds": $FIRST, "warmStartToReadySeconds": $WARM,
  "unauthenticatedStatus": $C1, "tokenExchangeStatus": $C2, "sessionListStatus": $C3,
- "stop": "$STOP1", "osCpus": $CPUS}
+ "stop": "$STOP1", "osCpus": $CPUS, "l2sRmRetryNeeded": $RM_RETRY}
 EOF
 cat "$RESULT"
