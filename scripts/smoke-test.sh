@@ -445,9 +445,13 @@ count_syscalls() { # <pack value> -> prints the number of path syscalls, or noth
   local pid=$!
   for _ in $(seq 1 600); do grep -q "dsh web: http://127.0.0.1:$PORT/?token=" "$out" 2>/dev/null && break; sleep 0.1; done
   sleep 0.5
-  sudo -n pkill -TERM -f "bin.js web --no-open --port $PORT" || true
+  sudo -n pkill -TERM -f "bin.js web .*--no-open --port $PORT" || true
   for _ in $(seq 1 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-  sudo -n pkill -KILL -f "bin.js web --no-open --port $PORT" || true
+  sudo -n pkill -KILL -f "bin.js web .*--no-open --port $PORT" || true
+  # The launcher puts `--patch <file>` after `web`, hence the `.*` above. Never wait for ever on a
+  # best-effort measurement: if the harness is still there, kill the wrapper too.
+  for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  sudo -n kill -KILL "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   sudo -n chown -R "$(id -u):$(id -g)" "$R/root" "$R/tmp" 2>/dev/null || true
   awk '$NF == "total" { print $4 }' "$sc" 2>/dev/null | head -1

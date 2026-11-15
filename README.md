@@ -613,7 +613,9 @@ Two things make a harness version that no longer fits fail the build instead of 
    `displayReason.en`. Answer `allowed-once` or `rejected`.
 5. A tool result with the error code `SANDBOX_UNAVAILABLE` means the session is on a mode that needs a
    kernel sandbox: sessions made by an older runtime that were left on `workspace-write`, or a run
-   with `DSH_RUNTIME_MOBILE_PATCH=0`. The way out is to switch the session to a preset above.
+   with `DSH_RUNTIME_MOBILE_PATCH=0`. The way out is to switch the session to a preset above. Such an
+   old session reports its preset as `custom` until it is switched (checked once by hand against a
+   session made by upstream's harness; not part of CI).
 6. Do not set `DSH_PERMISSION_MODE`: the patch does not read it.
 
 ## How the build works
