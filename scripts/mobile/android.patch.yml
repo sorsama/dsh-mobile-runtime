@@ -1,0 +1,51 @@
+# DSH Mobile runtime: permission presets for the built-in harness.
+# Passed to `dsh web` by /usr/local/bin/dsh as `--patch /opt/dsh/mobile/android.patch.yml`
+# (an overlay, applied after every bundle and profile patch). It changes no file of the
+# harness. DSH_RUNTIME_MOBILE_PATCH=0 leaves it out (upstream behaviour).
+#
+# Why: in its default "workspace-write" mode the harness runs shell commands inside a kernel
+# sandbox (bubblewrap or Landlock) and refuses every command (SANDBOX_UNAVAILABLE) when none
+# works. Neither can work inside an Android app, so the default mode cannot run one command
+# here. This overlay swaps the harness's three presets for two that work:
+#
+#   danger-full-access  "Full access"           upstream's own full-access bundle:
+#                                               sandbox danger-full-access, approval never.
+#   ask-commands        "Ask before commands"   the same file access, but every shell command
+#                                               is held for an approval (permission.mjs).
+#
+# DSH_RUNTIME_DEFAULT_PERMISSION picks the preset a new session starts with:
+#   full (or unset or empty)  -> danger-full-access
+#   ask                       -> ask-commands
+#   anything else             -> ask-commands (the safer one; the launcher also warns on stderr)
+# A default the user saved in the harness's own settings (permission.defaultPreset) wins over it.
+#
+# Fail closed, on purpose: this overlay does NOT touch the deployment defaults (sandbox-policy,
+# approval). They stay at upstream's values: workspace-write, which refuses commands on Android.
+# Only the service below pins a new session to full access, and the same service holds the
+# "ask" gate. If permission.mjs cannot load, there are no presets and no session reaches full
+# access: commands are refused, never run unasked.
+
+# Upstream's own permission row stays in the profile, switched off, so the two cannot both
+# provide the service.
+- id: permission
+  disabled: true
+
+- insert:
+    - id: mobile-permission
+      name: ./permission.mjs
+      config:
+        defaultPreset: !!js "['', 'full', 'danger-full-access'].includes((process.env.DSH_RUNTIME_DEFAULT_PERMISSION ?? '').trim().toLowerCase()) ? 'danger-full-access' : 'ask-commands'"
+        # The two presets must differ in their bundle (sandbox + approval): the harness derives
+        # a session's current preset from those two values, and with equal bundles it would
+        # always report the first one.
+        presets:
+          danger-full-access:
+            sandbox: danger-full-access
+            approval: never
+            name: Full access
+            description: Commands and file changes run without asking.
+          ask-commands:
+            sandbox: danger-full-access
+            approval: ask
+            name: Ask before commands
+            description: Shell commands wait until you allow each one.

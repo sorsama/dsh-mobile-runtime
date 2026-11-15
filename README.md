@@ -54,6 +54,8 @@ Asset URLs are `assetBaseUrl` from the manifest plus the file name.
     layer.json            {"harnessPackage", "harnessVersion", "releaseId", "abi", "baseId"}
     build-id              identity of this /opt/dsh build; the module pack is valid only for it
     runtime-pack/         module pack (pack.bin) and its preload, see "Startup: shared packages and the module pack"
+    mobile/               the Android permission presets: android.patch.yml and permission.mjs, see
+                          "Shell commands and permissions on Android"
   usr/local/bin/dsh       harness layer: launcher script, exec's node on the harness
 ```
 
@@ -122,7 +124,12 @@ that were always part of the build (see "How the build works"):
   and that sharing nested packages changed no dependency resolution;
 - ELF alignment of the arm64 bundle;
 - the smoke test under proot for both ABIs: the module pack on and off give the same JSON, all
-  degraded-pack cases still start, and a module outside `/opt/dsh` is read from disk;
+  degraded-pack cases still start, a module outside `/opt/dsh` is read from disk, and the shell
+  permission checks pass (a scripted fake model makes the real harness run its real tools; see
+  "Shell commands and permissions on Android");
+- the interface check of the Android permission patch against the harness version being built: if a
+  new harness version changed something the patch relies on, the build stops with a message that
+  names it, instead of publishing presets that silently do not work;
 - the manifest signature, checked against the public key committed here;
 - the previous release's manifest, which must verify against the same key, and the layer id check
   against it (a layer id is never reused for different content);
@@ -222,6 +229,7 @@ appears.
 | `runtime.fakeProc[]` | array of `{source, target}` | Files to bind over `/proc` entries (see "Running"). Paths are inside the guest. |
 | `runtime.resolvConf` | string | `/etc/resolv.conf`, the file the app should rewrite with the device DNS servers. |
 | `runtime.startup` | object, optional | Describes the start-up work in the harness layer. `startup.modulePack` has `enabledByDefault` (true), `disableEnv` (`DSH_RUNTIME_MODULE_PACK`), `disableValue` (`0`), `directory`, `buildIdFile`, `mechanism` and `validatedNodeVersion`. For information only: the app needs no change. |
+| `runtime.permissions` | object, optional | Present when this harness layer has the two permission presets and the environment switches (see "Shell commands and permissions on Android"). An installed runtime without it has none of that. Fields: `version` (1), `patch` (the overlay file in the guest), `catalogMethod` (`permissionPresets/catalog`), `presets[]` (each `{id, name, envValue, approval, asksBeforeCommands}`; the ids and names are what the running harness reports: `danger-full-access` "Full access", `ask-commands` "Ask before commands"), `defaultEnv` (`DSH_RUNTIME_DEFAULT_PERMISSION`), `defaultEnvValues` (`["full", "ask"]`), `defaultWhenUnset` (`danger-full-access`), `defaultForUnknownValue` (`ask-commands`), `disableEnv` (`DSH_RUNTIME_MOBILE_PATCH`), `disableValue` (`0`), `approvalChannel` (free text). |
 | `previous` | object, optional | The release before this one, so the app can offer "go back to the previous version". Absent in the first release. `previous.releaseId`, `previous.harnessVersion` (string), `previous.sequence` (int) and `previous.manifestUrl` (string, the URL of that release's `manifest.json`; its signature is `manifest.json.sig` in the same directory). The app fetches that manifest, verifies its signature with the same pinned key and installs it only on an explicit user action. See "How updates reach the app". |
 | `archs` | object | Keyed by Android ABI (`arm64-v8a`, `x86_64`). |
 | `archs.<abi>.debianArch` | string | `arm64` or `amd64`. |
@@ -353,6 +361,10 @@ Notes:
   itself. To turn it off, for example while chasing a start-up problem, add
   `DSH_RUNTIME_MODULE_PACK=0` to the `env -i` list. See "Startup: shared packages and the
   module pack".
+- `/usr/local/bin/dsh` also gives `dsh web` the Android permission presets (Full access, Ask before
+  commands). `DSH_RUNTIME_DEFAULT_PERMISSION=full` or `=ask` in the `env -i` list picks the preset a
+  new session starts with (default `full`), and `DSH_RUNTIME_MOBILE_PATCH=0` leaves the presets out.
+  See "Shell commands and permissions on Android".
 
 ## Startup: shared packages and the module pack
 
@@ -450,6 +462,160 @@ fetches the web page. A start that does something else may miss and fall back. T
 run must leave `/opt/dsh` unchanged, and the pack is replayed once more to check that it
 switches on and answers nearly everything.
 
+## Shell commands and permissions on Android
+
+### Why there is no kernel sandbox here
+
+The harness normally runs the model's shell commands inside a kernel sandbox (bubblewrap, or
+Landlock) and refuses to run a command when neither works. Its default mode, "Workspace Write",
+depends on one of them. Neither can work inside an Android app: Android kernels are built without
+user namespaces (so no bubblewrap), the Landlock system calls are not on Android's seccomp list for
+apps, and proot cannot make anything read-only. So in upstream's default mode every shell command
+fails with `SANDBOX_UNAVAILABLE`, and the harness cannot run a single command.
+
+This runtime therefore ships two presets of its own, in the harness layer, and starts `dsh web` with
+them. It changes no file of the harness.
+
+| Preset id | Name the harness reports | What it does |
+|---|---|---|
+| `danger-full-access` | Full access | Upstream's own full-access bundle: shell commands and file changes run without asking. **The default.** |
+| `ask-commands` | Ask before commands | The same file access, but every shell command waits for an approval that shows the command. |
+
+The ids and names are what `permissionPresets/catalog` returns from the running harness; CI checks
+them on both architectures. A new session starts on the default preset, and `/permission <id>` (or
+the harness's permission control) switches a session. The harness's own presets `read-only` and
+`workspace-write` are not offered: they could not run a command here anyway.
+
+### What Android still isolates, and what it does not
+
+Everything the runtime runs is part of the app: one Android user id, with the app's private storage
+only.
+
+- **Isolated:** the runtime cannot reach the user's photos, files in shared storage, contacts,
+  messages, or other apps and their data. This holds in both presets.
+- **Not isolated:** the network is open (a command can download and upload anything). A command can
+  delete or change the workspace and the whole harness home (`/root/.dsh`: session history, settings,
+  the stored API key), and can break the runtime's own files. A command, or the harness's own `read`
+  tool, can read the stored API key; that is also true in upstream's default mode. A command may be
+  able to end the app's own processes (same user id; not tried on a device).
+
+"Ask before commands" lets the user read each command before it runs. It is a question, not a
+sandbox: a command the user allows has the full reach described above, and a user who taps allow
+without reading gets no protection from it.
+
+### Choosing the default: `DSH_RUNTIME_DEFAULT_PERMISSION`
+
+Set it in the guest's `env -i ...` list (see "Running"). The launcher passes it through to the harness
+and the patch reads it.
+
+| Value | New sessions start on |
+|---|---|
+| unset, empty, `full` (also `danger-full-access`) | `danger-full-access` (Full access) |
+| `ask` | `ask-commands` (Ask before commands) |
+| anything else | `ask-commands`, and the launcher prints a warning on stderr (the safer preset wins a typo) |
+
+The value is read once, when the harness starts; to change it, restart the harness. Values are
+compared without case and without spaces around them. A preset a user chose in a session stays with
+that session. If the user saved a default preset in the harness's own settings, that saved choice
+wins over this variable (the harness's own rule; not exercised by CI), so an app that offers this
+choice should not also write the harness's default setting.
+
+### Turning the patch off: `DSH_RUNTIME_MOBILE_PATCH=0`
+
+`0`, `off`, `false` or `no` (any case) makes the launcher leave `--patch` out. The harness then is
+exactly the upstream one: presets `read-only`, `workspace-write` (the default) and
+`danger-full-access`, and every shell command is refused with `SANDBOX_UNAVAILABLE` in the default
+mode. Use it to rule the patch out while troubleshooting, or to compare. CI checks that it gives back
+upstream's presets and its refusal. `DSH_RUNTIME_MOBILE_PATCH` and `DSH_RUNTIME_DEFAULT_PERMISSION` are
+the only two variables involved.
+
+### What "Ask before commands" gates, and what it does not
+
+It acts on every model-initiated tool call, before the tool body starts, through the harness's own
+per-call gate (`tools/pre-execute`). The question goes to the app through the same approval request
+the harness already uses (`approval/request`, answered `allowed-once` or `rejected`), with the
+command in the reason and in `displayReason.en`. Only an `allowed-once` answer lets that one call
+run. A reject, a cancel, no answering client, or an error ends in a denial, and nothing runs.
+
+| Path | Gated in "Ask before commands"? | Checked by CI |
+|---|---|---|
+| The shell tool `bash` (standard agent preset), also with `run_in_background` | Yes: held for an approval | Yes |
+| The persistent shell (the `bash` tool of the minimal agent preset) | Yes: same tool name | Yes |
+| Code mode `run_code` (the ptc agent preset), whose program can start processes | Yes: held, the approval shows the program | Yes |
+| Tools a code-mode program or a workflow calls | Each nested call goes through the same pipeline, so the gate sees it (by the harness's design; not exercised separately) | No |
+| Subagents (`subagent`, `subagent_fork`, a workflow's `agent()`) | A subagent cannot ask anyone (the harness pins its approval policy to "never"), so its shell calls, `run_code` and file changes outside the workspace are **denied**, and it is told to say so. Subagents of a Full access session run freely | Yes, for `subagent` |
+| `plugin_manager` actions that change something (`set_plugin`, `set_bundle`, `install_bundle`, `remove_bundle`, `set_version_exemption`) | Yes. The `list_*` actions are not asked | Yes |
+| `write` and `edit` on a file outside the workspace (the workspace is the session's folder; the temp directory is allowed too) | Yes: held. Inside the workspace they run without a question. Links are followed, so a link inside the workspace that points out is caught | Yes |
+| `read`, `glob`, `grep`, and the web tools | No. They run in both presets. The harness's `read` can return any file, including the stored API key | Yes (`read`) |
+| `terminal_open` and `terminal_send` (model-facing terminal tools of the harness's optional terminal bundle) | Gated by name; the default profile does not mount them | No |
+| The terminal panel of the web page, and anything the user types there | **No.** It is the user typing into a shell, not a model call; there is nothing to ask | No |
+| A scheduled task | Not gated itself: its new sessions use the preset of the session that made it, and are gated like any session | No |
+| MCP servers the user configures in the harness | **No.** The harness starts them as its own processes; the gate sees only the tools they offer | No |
+
+In **Full access** the gate does nothing at all. Upstream's full-access mode also switches off the
+harness's file path fence, so `write` and `edit` can change any file the app can reach, with no
+question; CI pins this so a change shows. There is no "workspace path check" in either preset
+except the one the gate adds in "Ask before commands".
+
+Also true in "Ask before commands": the file tools can still change files inside the workspace, and
+the workspace may hold anything (a script the user later runs, a `.git/hooks` entry). The question
+guards commands and changes outside the workspace, not what the model writes into the workspace.
+The path of a `write` is judged by its text and by links as they are when the call is made; a
+relative path counts as relative to the workspace.
+
+### Fail closed
+
+The gate and the preset service are one module, `/opt/dsh/mobile/permission.mjs`, which extends the
+harness's own preset service class. This is on purpose. The harness starts even when a plugin cannot
+load (it only prints `dsh: warning: 1 entry did not activate`), so a separate gate plugin that failed
+to load would have left "Ask before commands" running commands without asking.
+
+- If `permission.mjs` cannot load, throws while starting, or needs a service that does not exist, the
+  harness starts with no presets at all. The patch leaves the harness's own deployment default
+  (`workspace-write`) in place, and only this module ever puts a session on full access, so every
+  shell command is refused as upstream refuses it. Nothing runs unasked.
+- If the module loads and its gate throws while a call is being checked, the harness answers that
+  call with an error and does not run it, even if the user would have allowed it.
+
+CI starts the harness with the module missing, with a syntax error, with a constructor that throws,
+with a required service that does not exist, and with a gate that throws, and requires that no
+command runs and no file appears. It also checks that the harness reports the module as not active.
+What this does not cover: the model's file tools can overwrite `/opt/dsh/mobile/permission.mjs` or
+the harness's configuration in "Ask before commands", because writes outside the workspace need a
+question but a user can allow one. "Ask before commands" is not a security boundary against a user
+who allows everything it asks.
+
+### How the build keeps this working, also for automatic releases
+
+The patch and module are part of the harness layer (`/opt/dsh/mobile/`, installed by
+`scripts/build-layers.sh` before the module pack is recorded, so the pack's build id covers them;
+the pack is recorded and replayed with the same `--patch` the launcher uses). The 6-hourly automatic
+release builds new harness versions through the same script, so every release carries them.
+Two things make a harness version that no longer fits fail the build instead of shipping:
+
+1. `scripts/mobile/check-interfaces.mjs` runs inside the build against the installed harness. It
+   checks the rows the patch replaces, the `tools/pre-execute` gate and the way an `ask` is resolved,
+   the service classes and methods the module reads, and the session header that names a subagent's
+   parent. It stops the build with a message that says what changed.
+2. The smoke test (above) then proves the behaviour itself on both architectures. A release is only
+   created if both pass.
+
+### What the app has to do
+
+1. Read `runtime.permissions` in the manifest. If it is absent, the installed runtime has no presets
+   and no switches (older release): do not pass `DSH_RUNTIME_*` variables expecting an effect.
+2. To choose the default for new sessions, add `DSH_RUNTIME_DEFAULT_PERMISSION=full` or `=ask` to the
+   `env -i ...` list of the guest command (see "Running"), and restart the harness after a change.
+   Do not also write the harness's own default-preset setting.
+3. Use `permissionPresets/catalog` for the list of presets, and `/permission <id>` to switch a
+   session. Show the app's own localized names and text for `danger-full-access` and `ask-commands`.
+4. Answer `approval/request` as it already does. The command is in `reason` (`bash: <command>`) and in
+   `displayReason.en`. Answer `allowed-once` or `rejected`.
+5. A tool result with the error code `SANDBOX_UNAVAILABLE` means the session is on a mode that needs a
+   kernel sandbox: sessions made by an older runtime that were left on `workspace-write`, or a run
+   with `DSH_RUNTIME_MOBILE_PATCH=0`. The way out is to switch the session to a preset above.
+6. Do not set `DSH_PERMISSION_MODE`: the patch does not read it.
+
 ## How the build works
 
 Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/build-runtime.yml):
@@ -467,7 +633,8 @@ Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/bui
    keys), applies the root file system fixes, and packs the base layer. It then installs the
    harness with npm inside the tree (chroot, install scripts enabled), proves nothing outside
    the harness paths changed, shares identical nested packages (`scripts/dedupe-modules.py`,
-   checked with `scripts/verify-resolution.mjs`), prunes, checks ELF alignment, records the
+   checked with `scripts/verify-resolution.mjs`), installs `/opt/dsh/mobile` and checks it against
+   the harness (`scripts/mobile/check-interfaces.mjs`), prunes, checks ELF alignment, records the
    module pack (`scripts/record-pack.sh`) and packs the harness layer.
 3. **Pruning** (`scripts/prune.py`) only removes directories named for another OS or another
    CPU architecture (such as `prebuilds/win32-x64` or `prebuilds/linux-arm64` on x86_64) that
@@ -489,6 +656,12 @@ Everything runs in [`.github/workflows/build-runtime.yml`](.github/workflows/bui
    still reach readiness and pass the session checks, with a pack message only on stderr.
    It runs a tiny ES module package under `/root` twice with different contents and requires the
    current content each time, so a module outside `/opt/dsh` is never served from the pack.
+   It then runs the shell permission checks (`scripts/shell-tests/`): a tiny local HTTP server plays
+   the model and asks for real tool calls, so the real harness runs its real tools under proot, and an
+   approval client speaking the harness's own client protocol answers the questions. It covers Full
+   access and Ask before commands (allow, reject, cancel, subagents, file tools, `plugin_manager`, the
+   persistent shell, code mode), both defaults, the escape hatch, and the permission module broken in
+   five ways (fail closed).
    Finally it measures the start to readiness three times for pack on and pack off and, when
    `strace` and passwordless `sudo` exist (they do on GitHub runners), counts the path system
    calls of one start of each natively. These results are in the job summary and the release

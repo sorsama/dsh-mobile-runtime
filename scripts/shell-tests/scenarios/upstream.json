@@ -1,0 +1,21 @@
+{
+  "comment": "DSH_RUNTIME_MOBILE_PATCH=0: the harness as upstream ships it. Its default mode needs a kernel sandbox, which does not work in this runtime, so a shell command is refused.",
+  "catalog": { "ids": ["read-only", "workspace-write", "danger-full-access"], "defaultPreset": "workspace-write" },
+  "scenarios": [
+    {
+      "name": "escape hatch: upstream presets, and the shell is refused with SANDBOX_UNAVAILABLE",
+      "calls": [ { "name": "bash", "input": { "command": "echo up > @WORK@/upstream.txt; echo OUT-upstream", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset workspace-write",
+        "results": [ { "tool": "bash", "isError": true, "match": "no sandbox backend is usable|refusing to run the command unconfined|SANDBOX_UNAVAILABLE" } ],
+        "approvals": [],
+        "files": { "absent": ["@WORK@/upstream.txt"] }
+      }
+    },
+    {
+      "name": "escape hatch: the file tools still work in the upstream default mode",
+      "calls": [ { "name": "write", "input": { "file_path": "@WORK@/up2.txt", "content": "x\n" } } ],
+      "expect": { "results": [ { "tool": "write", "isError": false } ], "approvals": [], "files": { "exists": ["@WORK@/up2.txt"] } }
+    }
+  ]
+}

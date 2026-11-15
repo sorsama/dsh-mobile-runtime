@@ -1,0 +1,17 @@
+{
+  "comment": "DSH_RUNTIME_DEFAULT_PERMISSION holds a value that is neither full nor ask: the safer preset is the default.",
+  "catalog": { "ids": ["danger-full-access", "ask-commands"], "defaultPreset": "ask-commands" },
+  "scenarios": [
+    {
+      "name": "unknown default value: a new session is on Ask before commands",
+      "answer": "rejected",
+      "calls": [ { "name": "bash", "input": { "command": "echo u > @WORK@/unknown.txt", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset ask-commands",
+        "results": [ { "tool": "bash", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "bash" } ],
+        "files": { "absent": ["@WORK@/unknown.txt"] }
+      }
+    }
+  ]
+}

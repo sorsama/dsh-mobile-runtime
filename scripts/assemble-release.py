@@ -21,6 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ABIS = ["arm64-v8a", "x86_64"]
 HARNESS_PATHS = ["/opt/dsh", "/usr/local/bin/dsh"]
 ID_HASH_LEN = 12
+# The permission presets of /opt/dsh/mobile/android.patch.yml, in the order the harness reports them.
+PRESET_IDS = ["danger-full-access", "ask-commands"]
 
 
 def check_against_previous(archs, prev_path):
@@ -160,6 +162,10 @@ def main():
         assert m["responsesIdenticalOnVsOff"] is True and m["outsideTreeModuleFromDisk"] is True, f"{abi}: module pack checks"
         assert m["degradedCasesPassed"] >= 9 and m["callsOk"] >= 20, f"{abi}: module pack checks"
         assert m["buildId"] == doc["modulePack"]["buildId"], f"{abi}: smoke test ran another pack"
+        sp = smoke[abi]["shellPermissions"]
+        assert sp["catalog"]["ids"] == PRESET_IDS and sp["catalog"]["defaultPreset"] == PRESET_IDS[0], \
+            f"{abi}: the harness reports presets {sp['catalog']}, not {PRESET_IDS}"
+        assert sp["harnessStarts"] >= 9 and sp["failClosedVariants"] >= 5 and sp["scenariosPassed"] >= 30, f"{abi}: shell permission checks"
         proot = [
             asset(os.path.join(pa, f"android-{abi}-libproot.so"), a.out, installAs="libproot.so"),
             asset(os.path.join(pa, f"android-{abi}-libproot-loader.so"), a.out, installAs="libproot-loader.so"),
@@ -192,6 +198,33 @@ def main():
     for abi in ABIS:
         for k, v in (("harnessVersion", harness_version), ("nodeVersion", node_version), ("debianSnapshot", snapshot)):
             assert layer_docs[abi][k] == v, f"{abi} has a different {k}"
+
+    # What the running harness reported for its presets (both architectures must agree); this is what
+    # the optional manifest field `runtime.permissions` describes.
+    cat = smoke[ABIS[0]]["shellPermissions"]["catalog"]
+    for abi in ABIS:
+        assert smoke[abi]["shellPermissions"]["catalog"] == cat, f"{abi} reports other permission presets"
+    names = dict(zip(cat["ids"], cat["names"]))
+    permissions = {
+        "version": 1,
+        "description": "Two permission presets for the built-in harness, because no kernel sandbox can run in an Android app. "
+                       "See the README, 'Shell commands and permissions on Android'.",
+        "patch": "/opt/dsh/mobile/android.patch.yml",
+        "catalogMethod": "permissionPresets/catalog",
+        "presets": [
+            {"id": "danger-full-access", "name": names["danger-full-access"], "envValue": "full", "approval": "never",
+             "asksBeforeCommands": False},
+            {"id": "ask-commands", "name": names["ask-commands"], "envValue": "ask", "approval": "ask",
+             "asksBeforeCommands": True},
+        ],
+        "defaultEnv": "DSH_RUNTIME_DEFAULT_PERMISSION",
+        "defaultEnvValues": ["full", "ask"],
+        "defaultWhenUnset": "danger-full-access",
+        "defaultForUnknownValue": "ask-commands",
+        "disableEnv": "DSH_RUNTIME_MOBILE_PATCH",
+        "disableValue": "0",
+        "approvalChannel": "approval/request, answered with allowed-once or rejected over the harness client protocol",
+    }
 
     check_against_previous(archs, a.previous_manifest)
     prev = json.load(open(a.previous_manifest)) if a.previous_manifest and os.path.exists(a.previous_manifest) else None
@@ -238,6 +271,9 @@ def main():
                 },
                 "dedupe": "identical nested packages (same name, version and content) are symlinks to one shared copy",
             },
+            # Optional. Present when this harness layer supports the two permission presets and the
+            # environment switches; an older runtime has no such field and no presets.
+            "permissions": permissions,
         },
         "archs": archs,
     }
@@ -294,7 +330,18 @@ def main():
         lines.append(f"| {abi} | {mib(mp['packBytes'])}, {mp['modules']:,} modules | {s['packOn']['medianSeconds']} s "
                      f"| {s['packOff']['medianSeconds']} s | {sc} "
                      f"| {dd['linkedCopies']} links, {dd['filesSaved']:,} files, {mib(dd['bytesSaved'])} saved |")
+    lines += ["", "Shell commands and permissions (nothing for the app to do except choose; see the README):", "",
+              "| Architecture | Harness starts | Scenarios passed | Fail-closed variants | Presets, as the running harness reports them |",
+              "|---|---|---|---|---|"]
+    for abi in ABIS:
+        sp = smoke[abi]["shellPermissions"]
+        presets = ", ".join(f"`{i}` ({n})" for i, n in zip(sp["catalog"]["ids"], sp["catalog"]["names"]))
+        lines.append(f"| {abi} | {sp['harnessStarts']} | {sp['scenariosPassed']} | {sp['failClosedVariants']} | {presets} |")
     lines += ["",
+              "`DSH_RUNTIME_DEFAULT_PERMISSION` (`full` or `ask`, default `full`) picks the preset a new session starts with, and "
+              "`DSH_RUNTIME_MOBILE_PATCH=0` switches the presets off again (upstream behaviour: every shell command is refused "
+              "with `SANDBOX_UNAVAILABLE`). The manifest describes both in the optional field `runtime.permissions`.",
+              "",
               "The module pack is on by default and `DSH_RUNTIME_MODULE_PACK=0` turns it off (see the README). "
               "Smoke test times are from the GitHub Actions runner under a Linux build of the same proot "
               "commit, not from a phone.",

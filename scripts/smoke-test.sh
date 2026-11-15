@@ -16,7 +16,14 @@
 #      preload and a preload that throws all leave a working harness, and the pack says
 #      so on stderr and never on stdout;
 #   4. a module outside /opt/dsh is read from disk, not from the pack;
-#   5. start-to-readiness is measured 3 times for pack on and pack off, and the path
+#   5. shell commands and permissions, with a scripted fake model that makes the real harness call
+#      its real tools: Full access runs a shell command without asking; Ask before commands holds it
+#      for an approval that carries the command (allow runs it once, reject and cancel run nothing);
+#      file tools, subagents, plugin_manager, the persistent shell and code mode behave as documented
+#      in both presets; DSH_RUNTIME_DEFAULT_PERMISSION switches the default both ways; the escape hatch
+#      DSH_RUNTIME_MOBILE_PATCH=0 gives back upstream's refusal (SANDBOX_UNAVAILABLE); and the
+#      permission module broken in five ways never lets a command run unasked (fail closed);
+#   6. start-to-readiness is measured 3 times for pack on and pack off, and the path
 #      system calls of one start of each are counted when strace and sudo are available.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -115,11 +122,13 @@ fail_with_logs() {
   exit 1
 }
 # start_harness [pack-env-value]: starts the harness through /usr/local/bin/dsh, like the app.
+# EXTRA_ENV (more NAME=value words for the guest's `env -i` list) and HARNESS_ARGS (the arguments
+# of dsh, default "web --no-open --port <port>") are set only by the shell permission tests.
 start_harness() {
-  GUEST_ENV=${1:+DSH_RUNTIME_MODULE_PACK=$1}
+  GUEST_ENV="${1:+DSH_RUNTIME_MODULE_PACK=$1} ${EXTRA_ENV:-}"
   : > "$LOG"; : > "$ERR"
   T_START=$(now)
-  proot_run "umask 022; mkdir -p /root/work && cd /root/work && exec dsh web --no-open --port $PORT" >"$LOG" 2>"$ERR" &
+  proot_run "umask 022; mkdir -p /root/work && cd /root/work && exec dsh ${HARNESS_ARGS:-web --no-open --port $PORT}" >"$LOG" 2>"$ERR" &
   PROOT_PID=$!
   local deadline=$(( $(date +%s) + 600 ))
   until grep -q "dsh web: http://127.0.0.1:$PORT/?token=" "$LOG"; do
@@ -321,6 +330,96 @@ rm -rf "$OUTSIDE" "$R/tmp/outside-misses.txt"
 OUTSIDE_OK=true
 
 ########################################################################
+echo "== shell commands and permissions: real tool calls from a scripted fake model, under proot"
+# A tiny local HTTP server plays the model (scripts/shell-tests/fake-model.mjs): it answers with the
+# tool calls a scenario asks for, so the real harness runs its real tools. Approval questions are
+# answered through the harness's own client protocol (answerer.mjs), like the app's approval panel.
+# No network, no key. Everything runs in the guest, with the guest's Node.js.
+ST=$R/tmp/shell-tests
+FAKE_PORT=8766
+FAKE_ENV="DEEPSEEK_API_KEY=sk-fake-ci-not-a-key DEEPSEEK_BASE_URL=http://127.0.0.1:$FAKE_PORT/anthropic"
+SHELL_STARTS=0; SHELL_SCENARIOS=0; SHELL_CLOSED=0
+rm -rf "$ST"; mkdir -p "$ST"
+cp "$HERE"/shell-tests/*.mjs "$HERE"/shell-tests/scenarios/*.json "$ST/"
+
+: > "$ST/fake.log"
+( GUEST_ENV=; proot_run "exec node /tmp/shell-tests/fake-model.mjs /tmp/shell-tests/fake.log $FAKE_PORT" ) >"$WORK/fake-model.out" 2>&1 &
+FAKE_PID=$!
+for _ in $(seq 1 100); do grep -q '"listening"' "$ST/fake.log" && break; kill -0 "$FAKE_PID" 2>/dev/null || break; sleep 0.1; done
+grep -q '"listening"' "$ST/fake.log" || { cat "$WORK/fake-model.out"; echo "the fake model did not start" >&2; exit 1; }
+stop_fake() {
+  local guest
+  guest=$(pgrep -P "$FAKE_PID" || true)
+  [ -n "$guest" ] && kill -TERM $guest 2>/dev/null || true
+  for _ in $(seq 1 30); do kill -0 "$FAKE_PID" 2>/dev/null || break; sleep 0.1; done
+  kill -KILL "$FAKE_PID" 2>/dev/null || true
+  wait "$FAKE_PID" 2>/dev/null || true
+}
+
+# shell_phase <label> <scenario file> <extra env words> [dsh arguments]: a fresh harness start with
+# an empty home and workspace, then every scenario of the file against it, then a clean stop.
+shell_phase() {
+  local label=$1 file=$2
+  EXTRA_ENV="$FAKE_ENV $3"; HARNESS_ARGS=${4:-}
+  reset_state
+  rm -rf "$R/root/work"; rm -f "$R"/root/*.txt; mkdir -p "$R/root/work"
+  : > "$ST/fake.log"
+  echo "-- phase $label ($file; env: ${3:-none})"
+  start_harness
+  SHELL_STARTS=$((SHELL_STARTS + 1))
+  if ! ( GUEST_ENV="DSH_TEST_TOKEN=$TOKEN"
+         proot_run "cd /tmp/shell-tests && exec node scenarios.mjs --port $PORT --fake-log /tmp/shell-tests/fake.log --work /root/work --file /tmp/shell-tests/$file --out /tmp/shell-tests/result-$label.json" ) 2>&1 | tee "$WORK/shell-$label.txt"; then
+    stop_fake || true
+    fail_with_logs "shell permission scenarios failed in phase $label (see the FAIL lines above)"
+  fi
+  n=$(grep -c '^PASS' "$WORK/shell-$label.txt" || true)
+  SHELL_SCENARIOS=$((SHELL_SCENARIOS + n))
+  stop_harness
+  unset EXTRA_ENV HARNESS_ARGS
+}
+
+# 1. The default start (DSH_RUNTIME_DEFAULT_PERMISSION unset): Full access, then every Ask before commands case.
+shell_phase default default-full.json ""
+SHELL_CATALOG=$(jq -c '.catalog' "$ST/result-default.json")
+echo "preset catalog as the harness reports it: $SHELL_CATALOG"
+# 2. The default switched to Ask before commands, and a value that is neither full nor ask.
+shell_phase ask-default ask-default.json "DSH_RUNTIME_DEFAULT_PERMISSION=ask"
+shell_phase unknown-default unknown-default.json "DSH_RUNTIME_DEFAULT_PERMISSION=banana"
+grep -q "DSH_RUNTIME_DEFAULT_PERMISSION is not 'full' or 'ask'" "$ERR" || fail_with_logs "the launcher did not warn about an unknown DSH_RUNTIME_DEFAULT_PERMISSION"
+# 3. The escape hatch: the harness exactly as upstream ships it, where the shell is refused.
+shell_phase upstream upstream.json "DSH_RUNTIME_MOBILE_PATCH=0"
+
+# 4. Fail closed. The same module, broken in five ways, is started in place of the shipped one (from
+# a directory outside /opt/dsh, with the launcher's patch off and --patch given by hand). No variant
+# may let a command run: the shell must be refused as upstream refuses it, or, when the module
+# loads and only its gate fails, the call must end in an error, and nothing may be written.
+echo "-- fail closed: the permission module cannot load, or breaks"
+mkvariant() { # <name>: a directory with the shipped patch and no module yet
+  rm -rf "$R/root/closed-$1"; mkdir -p "$R/root/closed-$1"; cp "$R/opt/dsh/mobile/android.patch.yml" "$R/root/closed-$1/"
+}
+# The shipped module with its import made absolute, so a copy outside /opt/dsh still finds the harness.
+shipped_module() { sed "s#from '@deepseek-ai/dsh-permission-presets'#from 'file:///opt/dsh/node_modules/@deepseek-ai/dsh-permission-presets/lib/index.js'#" "$R/opt/dsh/mobile/permission.mjs"; }
+mkvariant missing
+mkvariant syntax;  printf 'export default class {{{\n' > "$R/root/closed-syntax/permission.mjs"
+mkvariant ctor;    shipped_module | sed "s/super(ctx, config)/super(ctx, config); throw new Error('constructor boom')/" > "$R/root/closed-ctor/permission.mjs"
+mkvariant inject;  shipped_module | sed "s/'sandboxPolicy'\]/'sandboxPolicy', 'noSuchService']/" > "$R/root/closed-inject/permission.mjs"
+mkvariant handler; shipped_module | sed "s/if (kind === undefined) return next()/if (kind === undefined) return next(); throw new Error('handler boom')/" > "$R/root/closed-handler/permission.mjs"
+grep -q 'constructor boom' "$R/root/closed-ctor/permission.mjs" && grep -q 'noSuchService' "$R/root/closed-inject/permission.mjs" \
+  && grep -q 'handler boom' "$R/root/closed-handler/permission.mjs" && grep -q 'file:///opt/dsh/node_modules' "$R/root/closed-handler/permission.mjs" \
+  || { echo "the broken variants were not made (the shipped module changed shape)" >&2; exit 1; }
+for v in missing syntax ctor inject; do
+  # DSH_RUNTIME_DEFAULT_PERMISSION=full is what a user who wants no questions has; it must not matter.
+  shell_phase "closed-$v" closed.json "DSH_RUNTIME_MOBILE_PATCH=0 DSH_RUNTIME_DEFAULT_PERMISSION=full" "web --patch /root/closed-$v/android.patch.yml --no-open --port $PORT"
+  grep -q 'did not activate' "$ERR" || fail_with_logs "variant $v: the harness did not report the module as not active"
+  SHELL_CLOSED=$((SHELL_CLOSED + 1))
+done
+shell_phase closed-handler closed-handler.json "DSH_RUNTIME_MOBILE_PATCH=0 DSH_RUNTIME_DEFAULT_PERMISSION=ask" "web --patch /root/closed-handler/android.patch.yml --no-open --port $PORT"
+SHELL_CLOSED=$((SHELL_CLOSED + 1))
+stop_fake
+rm -rf "$R"/root/closed-* "$R"/root/work "$R"/root/*.txt; mkdir -p "$R/root/work"
+echo "shell permission checks passed: $SHELL_SCENARIOS scenarios in $SHELL_STARTS harness starts ($SHELL_CLOSED fail-closed variants)"
+
+########################################################################
 echo "== start to readiness, median of 3, pack on and pack off (interleaved)"
 ON_T=(); OFF_T=()
 for i in 1 2 3; do
@@ -373,6 +472,8 @@ cat > "$RESULT" <<EOF
  "modulePack": {"buildId": "$BUILD_ID", "packOn": {"startSeconds": [$(IFS=,; echo "${ON_T[*]}")], "medianSeconds": $ON_MED, "pathSyscalls": $ON_SC},
   "packOff": {"startSeconds": [$(IFS=,; echo "${OFF_T[*]}")], "medianSeconds": $OFF_MED, "pathSyscalls": $OFF_SC},
   "callsCompared": $CALLS_N, "callsOk": $ON_OK, "responsesIdenticalOnVsOff": $EQUAL,
-  "degradedCasesPassed": $DEGRADED, "outsideTreeModuleFromDisk": $OUTSIDE_OK}}
+  "degradedCasesPassed": $DEGRADED, "outsideTreeModuleFromDisk": $OUTSIDE_OK},
+ "shellPermissions": {"harnessStarts": $SHELL_STARTS, "scenariosPassed": $SHELL_SCENARIOS, "failClosedVariants": $SHELL_CLOSED,
+  "catalog": $SHELL_CATALOG}}
 EOF
 cat "$RESULT"

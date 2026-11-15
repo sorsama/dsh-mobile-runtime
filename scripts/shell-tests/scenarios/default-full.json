@@ -1,0 +1,184 @@
+{
+  "comment": "Harness started without DSH_RUNTIME_DEFAULT_PERMISSION: new sessions are on Full access. Then the same session kinds on Ask before commands.",
+  "catalog": { "ids": ["danger-full-access", "ask-commands"], "defaultPreset": "danger-full-access" },
+  "scenarios": [
+    {
+      "name": "full: a bash call runs without any approval",
+      "calls": [ { "name": "bash", "input": { "command": "echo ran-full > @WORK@/full.txt; echo OUT-full-123", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset danger-full-access",
+        "results": [ { "tool": "bash", "isError": false, "match": "OUT-full-123" } ],
+        "approvals": [],
+        "files": { "exists": ["@WORK@/full.txt"] }
+      }
+    },
+    {
+      "name": "full: file tools write, read and edit inside the workspace",
+      "calls": [
+        { "name": "write", "input": { "file_path": "@WORK@/f1.txt", "content": "hello file\n" } },
+        { "name": "read", "input": { "file_path": "@WORK@/f1.txt" } },
+        { "name": "edit", "input": { "file_path": "@WORK@/f1.txt", "old_string": "hello", "new_string": "bye" } }
+      ],
+      "expect": {
+        "results": [ { "tool": "write", "isError": false }, { "tool": "read", "isError": false, "match": "hello file" }, { "tool": "edit", "isError": false } ],
+        "approvals": [],
+        "files": { "exists": ["@WORK@/f1.txt"] }
+      }
+    },
+    {
+      "name": "full: the file tools can change a file outside the workspace without a question (upstream behaviour in full access)",
+      "calls": [ { "name": "write", "input": { "file_path": "@WORK@/../outside-full.txt", "content": "o\n" } } ],
+      "expect": { "results": [ { "tool": "write", "isError": false } ], "approvals": [], "files": { "exists": ["@WORK@/../outside-full.txt"] } }
+    },
+    {
+      "name": "full: plugin_manager list runs without asking",
+      "calls": [ { "name": "plugin_manager", "input": { "action": "list_bundles" } } ],
+      "expect": { "results": [ { "tool": "plugin_manager", "isError": false } ], "approvals": [] }
+    },
+    {
+      "name": "full: a subagent bash call runs",
+      "calls": [ { "name": "subagent", "input": { "description": "t", "prompt": "@@CALL {\"name\":\"bash\",\"input\":{\"command\":\"echo child-full > @WORK@/child-full.txt; echo CHILD-OUT-full\",\"description\":\"t\"}}" } } ],
+      "expect": {
+        "results": [ { "tool": "subagent", "isError": false }, { "tool": "bash", "isError": false, "match": "CHILD-OUT-full" } ],
+        "approvals": [],
+        "files": { "exists": ["@WORK@/child-full.txt"] }
+      }
+    },
+    {
+      "name": "ask: the command is held for an approval that carries it; allowing runs it once",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "calls": [ { "name": "bash", "input": { "command": "echo x >> @WORK@/count.txt; echo OUT-ask-123", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset ask-commands",
+        "results": [ { "tool": "bash", "isError": false, "match": "OUT-ask-123" } ],
+        "approvals": [ { "tool": "bash", "match": "echo x >> .*count\\.txt; echo OUT-ask-123" } ],
+        "exactResults": 1,
+        "files": { "lines": { "@WORK@/count.txt": 1 } }
+      }
+    },
+    {
+      "name": "ask: rejecting runs nothing and writes nothing",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [ { "name": "bash", "input": { "command": "echo y > @WORK@/rejected.txt; echo y > @WORK@/../rejected-outside.txt", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "bash", "match": "rejected\\.txt" } ],
+        "exactResults": 1,
+        "files": { "absent": ["@WORK@/rejected.txt", "@WORK@/../rejected-outside.txt"] }
+      }
+    },
+    {
+      "name": "ask: a background command is held too",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [ { "name": "bash", "input": { "command": "echo bg > @WORK@/background.txt", "run_in_background": true, "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "bash", "match": "background\\.txt" } ],
+        "files": { "absent": ["@WORK@/background.txt"] }
+      }
+    },
+    {
+      "name": "ask: a cancelled question runs nothing",
+      "preset": "ask-commands",
+      "answer": "cancelled",
+      "calls": [ { "name": "bash", "input": { "command": "echo z > @WORK@/cancelled.txt", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "cancel" } ],
+        "approvals": [ { "tool": "bash" } ],
+        "files": { "absent": ["@WORK@/cancelled.txt"] }
+      }
+    },
+    {
+      "name": "ask: file tools still work without a question",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [
+        { "name": "write", "input": { "file_path": "@WORK@/f2.txt", "content": "hello ask\n" } },
+        { "name": "read", "input": { "file_path": "@WORK@/f2.txt" } },
+        { "name": "edit", "input": { "file_path": "@WORK@/f2.txt", "old_string": "hello", "new_string": "bye" } }
+      ],
+      "expect": {
+        "results": [ { "tool": "write", "isError": false }, { "tool": "read", "isError": false, "match": "hello ask" }, { "tool": "edit", "isError": false } ],
+        "approvals": [],
+        "files": { "exists": ["@WORK@/f2.txt"] }
+      }
+    },
+    {
+      "name": "ask: a file change outside the workspace is held; rejecting writes nothing",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [ { "name": "write", "input": { "file_path": "@WORK@/../outside-ask-rejected.txt", "content": "o\n" } } ],
+      "expect": {
+        "results": [ { "tool": "write", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "write", "match": "outside-ask-rejected\\.txt" } ],
+        "files": { "absent": ["@WORK@/../outside-ask-rejected.txt"] }
+      }
+    },
+    {
+      "name": "ask: a file change outside the workspace runs once it is allowed, also through a symbolic link",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "calls": [
+        { "name": "write", "input": { "file_path": "@WORK@/../outside-ask-allowed.txt", "content": "o\n" } },
+        { "name": "bash", "input": { "command": "ln -s @WORK@/.. @WORK@/link", "description": "t" } },
+        { "name": "write", "input": { "file_path": "@WORK@/link/outside-ask-linked.txt", "content": "o\n" } }
+      ],
+      "expect": {
+        "results": [ { "tool": "write", "isError": false }, { "tool": "bash", "isError": false }, { "tool": "write", "isError": false } ],
+        "approvals": [ { "tool": "write", "match": "outside-ask-allowed" }, { "tool": "bash", "match": "ln -s" }, { "tool": "write", "match": "outside-ask-linked" } ],
+        "files": { "exists": ["@WORK@/../outside-ask-allowed.txt", "@WORK@/../outside-ask-linked.txt"] }
+      }
+    },
+    {
+      "name": "ask: plugin_manager list needs no question, a change is held",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [
+        { "name": "plugin_manager", "input": { "action": "list_bundles" } },
+        { "name": "plugin_manager", "input": { "action": "set_bundle", "target": "no-such-bundle", "enabled": false } }
+      ],
+      "expect": {
+        "results": [ { "tool": "plugin_manager", "isError": false }, { "tool": "plugin_manager", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "plugin_manager", "match": "set_bundle" } ]
+      }
+    },
+    {
+      "name": "ask: a subagent cannot ask, so its bash call is denied and nothing runs",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "calls": [ { "name": "subagent", "input": { "description": "t", "prompt": "@@CALL {\"name\":\"bash\",\"input\":{\"command\":\"echo child-ask > @WORK@/child-ask.txt\",\"description\":\"t\"}}" } } ],
+      "expect": {
+        "results": [ { "tool": "subagent", "isError": false }, { "tool": "bash", "isError": true, "match": "cannot ask the user" } ],
+        "approvals": [],
+        "files": { "absent": ["@WORK@/child-ask.txt"] }
+      }
+    },
+    {
+      "name": "ask: the persistent shell of the minimal agent preset asks too",
+      "agentPreset": "minimal",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [ { "name": "bash", "input": { "command": "echo m > @WORK@/minimal.txt", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "bash", "match": "minimal\\.txt" } ],
+        "files": { "absent": ["@WORK@/minimal.txt"] }
+      }
+    },
+    {
+      "name": "ask: a code-mode program (run_code) asks before it runs",
+      "agentPreset": "ptc",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "calls": [ { "name": "run_code", "input": { "code": "const cp = await import('node:child_process'); cp.execSync('echo p > @WORK@/ptc.txt'); return 1", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "run_code", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "run_code", "match": "child_process" } ],
+        "files": { "absent": ["@WORK@/ptc.txt"] }
+      }
+    }
+  ]
+}

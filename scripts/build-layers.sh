@@ -176,6 +176,16 @@ in_root node /tmp/verify-resolution.mjs snapshot /opt/dsh/node_modules /tmp/reso
 in_root node /tmp/verify-resolution.mjs compare /tmp/resolution-before.json /tmp/resolution-after.json /opt/dsh/node_modules
 find "$R/opt/dsh" -not -type d | wc -l > "$WORK/harness-files-deduped"
 log "dedupe: $(cat "$WORK/harness-files-installed") -> $(cat "$WORK/harness-files-deduped") files"
+
+log "Android permission presets: install /opt/dsh/mobile and check it against this harness version"
+# Two files inside the harness tree (so the harness layer owns them and replaces them as a whole):
+# the patch that /usr/local/bin/dsh passes to `dsh web`, and the module it mounts. They must be in
+# place before the module pack is recorded, because the pack's build id covers the whole tree.
+install -d -m 755 "$R/opt/dsh/mobile"
+install -m 644 "$HERE/mobile/android.patch.yml" "$HERE/mobile/permission.mjs" "$R/opt/dsh/mobile/"
+install -m 644 "$HERE/mobile/check-interfaces.mjs" "$R/tmp/check-interfaces.mjs"
+# Stops the build with a message that names what changed if this harness version no longer fits.
+in_root node /tmp/check-interfaces.mjs /opt/dsh | tee "$OUT/mobile-interfaces-$ABI.txt"
 cleanup_mounts; trap - EXIT
 cp -a "$WORK/resolv.conf.saved" "$R/etc/resolv.conf"
 rm -rf "$R"/tmp/* "$R"/tmp/.[!.]* "$R/root/.npm" "$R/root/.cache" "$R/root/.config"

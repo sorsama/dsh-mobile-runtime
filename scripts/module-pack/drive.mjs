@@ -6,6 +6,8 @@
 //             --record <record.mjs> --calls <calls.json> --out <dir> --build-id <id> --work <scratch dir>
 //   replay: node drive.mjs --mode replay --node ... --bin ... --preload <preload.mjs> --calls ... --work ...
 //           (same calls with the pack on; prints the pack's hit and miss counts and fails if it is off)
+// Both take an optional --patch <file>: passed to `dsh web` like the launcher does, so the pack is
+// recorded and checked with the same permission presets the shipped bundle starts with.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -40,7 +42,7 @@ const env = {
   PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/node/bin',
   ...(REPLAY ? { DSH_RUNTIME_MODULE_PACK_DEBUG: '1', ...(process.env.DSH_RUNTIME_MODULE_PACK_MISSES ? { DSH_RUNTIME_MODULE_PACK_MISSES: process.env.DSH_RUNTIME_MODULE_PACK_MISSES } : {}) } : { DSH_PACK_OUT: args.out, DSH_PACK_BUILD_ID: args['build-id'] }),
 };
-const child = spawn(args.node, ['--import', REPLAY ? args.preload : args.record, args.bin, 'web', '--no-open', '--port', String(port)], { env, cwd: ws, stdio: ['ignore', 'pipe', 'pipe'] });
+const child = spawn(args.node, ['--import', REPLAY ? args.preload : args.record, args.bin, 'web', ...(args.patch ? ['--patch', args.patch] : []), '--no-open', '--port', String(port)], { env, cwd: ws, stdio: ['ignore', 'pipe', 'pipe'] });
 let out = '', err = '';
 child.stdout.on('data', (d) => { out += d; });
 child.stderr.on('data', (d) => { err += d; });

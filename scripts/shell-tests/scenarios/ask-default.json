@@ -1,0 +1,39 @@
+{
+  "comment": "Harness started with DSH_RUNTIME_DEFAULT_PERMISSION=ask: new sessions start on Ask before commands.",
+  "catalog": { "ids": ["danger-full-access", "ask-commands"], "defaultPreset": "ask-commands" },
+  "scenarios": [
+    {
+      "name": "ask default: a new session is on Ask before commands and holds the command",
+      "answer": "allowed-once",
+      "calls": [ { "name": "bash", "input": { "command": "echo x >> @WORK@/count-d.txt; echo OUT-askdefault", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset ask-commands",
+        "results": [ { "tool": "bash", "isError": false, "match": "OUT-askdefault" } ],
+        "approvals": [ { "tool": "bash", "match": "count-d\\.txt" } ],
+        "exactResults": 1,
+        "files": { "lines": { "@WORK@/count-d.txt": 1 } }
+      }
+    },
+    {
+      "name": "ask default: rejecting runs nothing",
+      "answer": "rejected",
+      "calls": [ { "name": "bash", "input": { "command": "echo y > @WORK@/rejected-d.txt", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "bash" } ],
+        "files": { "absent": ["@WORK@/rejected-d.txt"] }
+      }
+    },
+    {
+      "name": "ask default: switching the session to Full access stops the questions",
+      "preset": "danger-full-access",
+      "calls": [ { "name": "bash", "input": { "command": "echo full-switch > @WORK@/switched.txt; echo OUT-switched", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset danger-full-access",
+        "results": [ { "tool": "bash", "isError": false, "match": "OUT-switched" } ],
+        "approvals": [],
+        "files": { "exists": ["@WORK@/switched.txt"] }
+      }
+    }
+  ]
+}

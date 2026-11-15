@@ -33,8 +33,13 @@ cleanup() { umount -R "$R/dev" 2>/dev/null || true; umount "$R/proc" "$R/sys" 2>
 trap cleanup EXIT
 in_root() { chroot "$R" /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/node/bin LANG=C.UTF-8 "$@"; }
 
+# The launcher passes the Android permission patch to `dsh web`; record and replay with it too, so
+# the pack is made from the same start as the shipped one. It is part of the tree fingerprint above.
+PATCH_ARGS=()
+if [ -f "$R/opt/dsh/mobile/android.patch.yml" ]; then PATCH_ARGS=(--patch /opt/dsh/mobile/android.patch.yml); fi
+
 echo "== record"
-in_root /opt/node/bin/node /tmp/pack-build/tools/drive.mjs --mode record --node /opt/node/bin/node --bin "$BIN" \
+in_root /opt/node/bin/node /tmp/pack-build/tools/drive.mjs --mode record --node /opt/node/bin/node --bin "$BIN" "${PATCH_ARGS[@]}" \
   --record /tmp/pack-build/tools/record.mjs --calls /tmp/pack-build/tools/calls.json \
   --out /tmp/pack-build/out --build-id "$BUILD_ID" --work /tmp/pack-build/work
 cat "$T/out/pack-summary.json"
@@ -50,7 +55,7 @@ ls -la "$R/opt/dsh/runtime-pack"
 
 echo "== replay check (pack on, same calls)"
 rm -rf "$T/work-replay"
-in_root /opt/node/bin/node /tmp/pack-build/tools/drive.mjs --mode replay --node /opt/node/bin/node --bin "$BIN" \
+in_root /opt/node/bin/node /tmp/pack-build/tools/drive.mjs --mode replay --node /opt/node/bin/node --bin "$BIN" "${PATCH_ARGS[@]}" \
   --preload /opt/dsh/runtime-pack/preload.mjs --calls /tmp/pack-build/tools/calls.json --work /tmp/pack-build/work-replay \
   | tee "$T/replay.txt"
 [ "$(fp)" = "$FP" ] || { echo "FAIL: the replay run changed /opt/dsh" >&2; exit 1; }

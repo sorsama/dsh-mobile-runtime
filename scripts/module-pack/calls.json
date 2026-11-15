@@ -10,6 +10,7 @@
     { "method": "session/rename", "args": { "request": { "sessionId": "@SESSION_ID@", "title": "pack check" } } },
     { "method": "session/modelCatalog", "args": {} },
     { "method": "session/canOpenWorkspacePath", "args": {} },
+    { "method": "permissionPresets/catalog", "args": {} },
     { "method": "agentPresets/list", "args": {} },
     { "method": "agentPresets/read", "args": { "agentPreset": "standard" } },
     { "method": "account/getState", "args": {} },

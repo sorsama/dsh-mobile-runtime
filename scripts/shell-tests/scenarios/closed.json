@@ -1,0 +1,15 @@
+{
+  "comment": "The permission module could not load (missing, syntax error, constructor throws, a required service is absent). There are no presets then, and the harness keeps its own default mode, which refuses the shell here. Nothing may run, and no question is asked.",
+  "scenarios": [
+    {
+      "name": "closed: a shell command is refused, nothing runs, nothing is asked",
+      "answer": "allowed-once",
+      "calls": [ { "name": "bash", "input": { "command": "echo c > @WORK@/closed.txt; echo c > @WORK@/../closed-outside.txt; echo OUT-closed", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "no sandbox backend is usable|refusing to run the command unconfined|SANDBOX_UNAVAILABLE" } ],
+        "approvals": [],
+        "files": { "absent": ["@WORK@/closed.txt", "@WORK@/../closed-outside.txt"] }
+      }
+    }
+  ]
+}
