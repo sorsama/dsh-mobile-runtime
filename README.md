@@ -471,7 +471,7 @@ Landlock) and refuses to run a command when neither works. Its default mode, "Wo
 depends on one of them. Neither can work inside an Android app: Android kernels are built without
 user namespaces (so no bubblewrap), the Landlock system calls are not on Android's seccomp list for
 apps, and proot cannot make anything read-only. So in upstream's default mode every shell command
-fails with `SANDBOX_UNAVAILABLE`, and the harness cannot run a single command.
+is refused as `SANDBOX_UNAVAILABLE` (the harness's name for it; see point 5 under "What the app has to do" for what the app receives), and the harness cannot run a single command.
 
 This runtime therefore ships two presets of its own, in the harness layer, and starts `dsh web` with
 them. It changes no file of the harness.
@@ -524,7 +524,7 @@ choice should not also write the harness's default setting.
 
 `0`, `off`, `false` or `no` (any case) makes the launcher leave `--patch` out. The harness then is
 exactly the upstream one: presets `read-only`, `workspace-write` (the default) and
-`danger-full-access`, and every shell command is refused with `SANDBOX_UNAVAILABLE` in the default
+`danger-full-access`, and every shell command is refused (`SANDBOX_UNAVAILABLE`, see point 5 under "What the app has to do") in the default
 mode. Use it to rule the patch out while troubleshooting, or to compare. CI checks that it gives back
 upstream's presets and its refusal. `DSH_RUNTIME_MOBILE_PATCH` and `DSH_RUNTIME_DEFAULT_PERMISSION` are
 the only two variables involved.
@@ -665,25 +665,35 @@ Two things make a harness version that no longer fits fail the build instead of 
    Read a denial from the `tool/result` event: `data.error.code` (list in "Denial codes", also in the
    manifest as `runtime.permissions.denialCodes`) instead of matching the sentence. Without the field
    (`runtime.permissions.version` below 2) the sentence is all there is.
-5. **A session left on `workspace-write` is not told apart by a code.** This is the case of a session
-   made by an older runtime that was left on `workspace-write`, or of a run with
-   `DSH_RUNTIME_MOBILE_PATCH=0`: the harness then refuses every shell command because no kernel sandbox
-   can work here. The app does **not** receive the code `SANDBOX_UNAVAILABLE` for it. In harness
-   0.2.2-rc.1 the foreground `bash` tool runs the command as a job, and when the job cannot start it
-   re-throws the failure as a plain `Error` (`throw new Error(view.detail)` in `dsh-tool-bash`,
-   `waitOnJob`), which loses the code that the sandbox error carries. What the client receives is a
-   `tool/result` event with `data.message.isError` true, **no `data.error` at all**, and as its content
-   the single text block
-   `Error: sandbox mode "workspace-write" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL restricted-token runner can start (Windows) — otherwise switch the consumer to danger-full-access.`
-   (the same sentence is the `detail` of the `job/settled` event of that call, with `status: "failed"`).
-   To recognise it, match the start of that sentence (`sandbox mode "` ... `is requested but no sandbox
-   backend is usable on this host`), or better: check the session's preset with `/permission` (it is
-   `workspace-write` or `custom`, not one of the two presets above) and switch it to a preset above.
-   This is an upstream issue (the structured error is lost on the foreground path); a later harness may
-   deliver the code `SANDBOX_UNAVAILABLE` there, so an app can accept both. CI reads exactly what the
-   client gets in this case (on both architectures, under proot, where no sandbox can work) and prints
-   it, accepting either "no code" or `SANDBOX_UNAVAILABLE`. Checked: the foreground `bash` call. Not
-   checked: a background `bash` call (`run_in_background`) in this case.
+5. **A session left on `workspace-write`: the code `SANDBOX_UNAVAILABLE` arrives in one of two cases
+   and not in the other. Do not rely on the code alone.** This is the case of a session made by an
+   older runtime that was left on `workspace-write`, or of a run with `DSH_RUNTIME_MOBILE_PATCH=0`: the
+   harness refuses every shell command because no kernel sandbox can work here. The harness
+   (0.2.2-rc.1) has two ways to refuse, with the same sentence and different results for the client:
+   - **No sandbox runner is usable at all** (the harness finds neither bubblewrap nor a working
+     Landlock launcher when it starts the command). The foreground `bash` tool runs the command as a
+     job, and when the job cannot start, `waitOnJob` in `dsh-tool-bash` re-throws the failure as a plain
+     `Error` (`throw new Error(view.detail)`), which loses the code the sandbox error carries. The client
+     receives a `tool/result` event with `data.message.isError` true and **no `data.error` at all**, and
+     as its content the single text block
+     `Error: sandbox mode "workspace-write" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL restricted-token runner can start (Windows) — otherwise switch the consumer to danger-full-access.`
+     (the same sentence is the `detail` of the `job/settled` event of that call, with `status: "failed"`).
+     This is an upstream issue: the structured error is lost on this path. It is the case the Android app
+     reported on a device. It was reproduced here with the same harness version and Node.js on a Linux
+     host after making the Landlock launcher unavailable (not on a device, not under proot).
+   - **A runner is picked but cannot start the command** (what CI sees, on both architectures, under proot
+     on the runner; by the harness's code this is the path of a runner that was chosen and then failed to
+     start the command, `dsh-bash-sandbox`). The error is thrown from the command's own result, so the
+     code arrives: `tool/result` `data.error` =
+     `{ "name": "SandboxUnavailableError", "code": "SANDBOX_UNAVAILABLE" }`, with the same sentence (it
+     may end with ` Runner failure: <detail>`) as the content.
+   To recognise both, match `data.error.code === "SANDBOX_UNAVAILABLE"` **or** an error result whose text
+   starts with `Error: sandbox mode "` and contains `is requested but no sandbox backend is usable on this
+   host`; or better, check the session's preset with `/permission` (it is `workspace-write` or `custom`,
+   not one of the two presets above) and switch it to a preset above. CI reads exactly what the client
+   gets in its case and prints it, and accepts either result, so a later harness that fixes the first case
+   does not stop a release. Checked: the foreground `bash` call. Not checked: a background `bash` call
+   (`run_in_background`) in this case.
    Such an old session reports its preset as `custom` until it is switched (checked once by hand against
    a session made by upstream's harness; not part of CI).
 6. Do not set `DSH_PERMISSION_MODE`: the patch does not read it.

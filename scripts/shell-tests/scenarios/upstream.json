@@ -3,7 +3,7 @@
   "catalog": { "ids": ["read-only", "workspace-write", "danger-full-access"], "defaultPreset": "workspace-write" },
   "scenarios": [
     {
-      "name": "escape hatch: upstream presets, and the shell is refused with SANDBOX_UNAVAILABLE",
+      "name": "escape hatch: upstream presets, and the shell is refused (with the code SANDBOX_UNAVAILABLE here, under proot; see the README for the case without a code)",
       "calls": [ { "name": "bash", "input": { "command": "echo up > @WORK@/upstream.txt; echo OUT-upstream", "description": "t" } } ],
       "expect": {
         "presetText": "current preset workspace-write",

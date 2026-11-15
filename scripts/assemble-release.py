@@ -373,8 +373,8 @@ def main():
         lines.append(f"| {abi} | {sp['harnessStarts']} | {sp['scenariosPassed']} | {sp['failClosedVariants']} | {presets} |")
     lines += ["",
               "`DSH_RUNTIME_DEFAULT_PERMISSION` (`full` or `ask`, default `full`) picks the preset a new session starts with, and "
-              "`DSH_RUNTIME_MOBILE_PATCH=0` switches the presets off again (upstream behaviour: every shell command is refused "
-              "by the harness's own refusal, which carries no code; see the README). The manifest describes both in the optional field `runtime.permissions`, "
+              "`DSH_RUNTIME_MOBILE_PATCH=0` switches the presets off again (upstream behaviour: every shell command is refused; "
+              "the refusal carries the code `SANDBOX_UNAVAILABLE` in some cases and no code in others, see the README). The manifest describes both in the optional field `runtime.permissions`, "
               "version 2: the approval question carries the whole text of the command (never cut; above "
               f"{permission_module_facts()[1]:,} bytes the call is refused with the code `APPROVAL_TEXT_TOO_LARGE` instead of being asked), "
               "and every denial of the gate has a code in the `tool/result` event.",
