@@ -35,6 +35,11 @@ const pipeline = read('dsh-tools/lib/pipeline.js');
 need(pipeline.includes('"tools/pre-execute"'), 'dsh-tools no longer runs the waterfall `tools/pre-execute` before a tool call (the gate of Ask before commands)');
 need(pipeline.includes('serviceAsk') && pipeline.includes('"allowed-once"'), 'dsh-tools no longer resolves an `ask` decision through the approval service with the outcome "allowed-once"');
 need(/kind === "ask"/.test(pipeline) && /kind: "deny"/.test(pipeline), 'dsh-tools no longer knows the pre-execute decisions `ask` and `deny`');
+// The gate asks the approval service itself (so that each way a question ends has its own code), and
+// hands back `allow`, `cancel` or `deny` with `info`. These are the pipeline's own readings of those.
+need(pipeline.includes('approval.request({') && pipeline.includes('callId: exec.callId'), 'dsh-tools no longer asks the approval service with approval.request({ agent, toolName, callId, reason, displayReason, signal }) (the gate asks the same way)');
+need(/decision\.kind === "cancel"/.test(pipeline), 'dsh-tools no longer knows the pre-execute decision `cancel` (the gate answers it when a turn is stopped during a question)');
+need(/decision\.kind === "deny" \? decision\.info/.test(pipeline) && /error: \{\s*message: denialReason,[\s\S]{0,80}info: denialInfo/.test(pipeline), 'dsh-tools no longer carries the `info` of a pre-execute denial into the tool error (the codes of the gate travel there)');
 
 // 3. The service classes the gate reads.
 const load = async (rel) => import(pathToFileURL(`${nm}/${rel}`).href);
@@ -48,6 +53,7 @@ try {
 try {
   const Approval = (await load('dsh-user-approval/lib/index.js')).ApprovalService;
   need(typeof Approval?.prototype?.effectivePolicy === 'function', 'the approval service has no method effectivePolicy()');
+  need(typeof Approval?.prototype?.request === 'function', 'the approval service has no method request() (the gate asks with it)');
 } catch (error) { need(false, `dsh-user-approval cannot be imported: ${error.message}`); }
 try {
   const Sandbox = (await load('dsh-sandbox-policy/lib/index.js')).SandboxPolicyService;

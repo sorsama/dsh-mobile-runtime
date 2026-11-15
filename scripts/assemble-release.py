@@ -15,6 +15,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -23,6 +24,31 @@ HARNESS_PATHS = ["/opt/dsh", "/usr/local/bin/dsh"]
 ID_HASH_LEN = 12
 # The permission presets of /opt/dsh/mobile/android.patch.yml, in the order the harness reports them.
 PRESET_IDS = ["danger-full-access", "ask-commands"]
+# What the gate of /opt/dsh/mobile/permission.mjs says when it denies a call: the code (`tool/result` event,
+# `data.error.code`) and when it is used. The assembler reads the codes and the size limit from the module itself
+# and stops if this table and the module disagree, so the manifest never documents something the code does not do.
+DENIAL_CODES = {
+    "APPROVAL_NOT_AVAILABLE_TO_SUBAGENT": "A subagent of an 'Ask before commands' session made a gated call; a subagent cannot ask.",
+    "APPROVAL_OWNER_SESSION_GONE": "The session that started the subagent is gone, so nobody can be asked.",
+    "APPROVAL_SWITCHED_OFF": "Approval is switched off in the session, so a question cannot be asked.",
+    "APPROVAL_REJECTED_BY_USER": "The user answered reject.",
+    "APPROVAL_CANCELLED": "The question was cancelled while the turn was still running.",
+    "APPROVAL_UNAVAILABLE": "No client answered, so there is no approval channel.",
+    "APPROVAL_TEXT_TOO_LARGE": "The text to approve is over approvalTextLimitBytes; nothing was asked and nothing ran.",
+    "APPROVAL_TEXT_UNREADABLE": "The arguments could not be turned into text to show; nothing was asked and nothing ran.",
+    "PERMISSION_GATE_ERROR": "The gate itself failed, so the call was not run.",
+}
+
+
+def permission_module_facts():
+    """The denial codes and the approval size limit, read from the shipped permission module."""
+    src = open(os.path.join(HERE, "mobile", "permission.mjs")).read()
+    block = re.search(r"export const CODES = Object\.freeze\(\{(.*?)\n\}\)", src, re.S)
+    assert block, "permission.mjs has no CODES block"
+    codes = re.findall(r"^\s+[A-Z_]+: '([A-Z_]+)',", block.group(1), re.M)
+    limit = re.search(r"export const MAX_APPROVAL_BYTES = (\d+) \* (\d+)", src)
+    assert limit, "permission.mjs has no MAX_APPROVAL_BYTES"
+    return codes, int(limit.group(1)) * int(limit.group(2))
 
 
 def check_against_previous(archs, prev_path):
@@ -205,8 +231,12 @@ def main():
     for abi in ABIS:
         assert smoke[abi]["shellPermissions"]["catalog"] == cat, f"{abi} reports other permission presets"
     names = dict(zip(cat["ids"], cat["names"]))
+    module_codes, limit_bytes = permission_module_facts()
+    assert sorted(module_codes) == sorted(DENIAL_CODES), f"denial codes differ between permission.mjs {sorted(module_codes)} and assemble-release.py {sorted(DENIAL_CODES)}"
     permissions = {
-        "version": 1,
+        # 2: the question carries the whole text (limit approvalTextLimitBytes, above it the call is refused),
+        # and every denial of the gate has a code. Version 1 shortened the text to 2000 characters and had no codes.
+        "version": 2,
         "description": "Two permission presets for the built-in harness, because no kernel sandbox can run in an Android app. "
                        "See the README, 'Shell commands and permissions on Android'.",
         "patch": "/opt/dsh/mobile/android.patch.yml",
@@ -224,6 +254,10 @@ def main():
         "disableEnv": "DSH_RUNTIME_MOBILE_PATCH",
         "disableValue": "0",
         "approvalChannel": "approval/request, answered with allowed-once or rejected over the harness client protocol",
+        "approvalTextComplete": True,
+        "approvalTextLimitBytes": limit_bytes,
+        "denialCodeField": "tool/result event, data.error.code (data.error.name is DshMobilePermissionDenied)",
+        "denialCodes": [{"code": c, "when": DENIAL_CODES[c]} for c in module_codes],
     }
 
     check_against_previous(archs, a.previous_manifest)
@@ -340,7 +374,10 @@ def main():
     lines += ["",
               "`DSH_RUNTIME_DEFAULT_PERMISSION` (`full` or `ask`, default `full`) picks the preset a new session starts with, and "
               "`DSH_RUNTIME_MOBILE_PATCH=0` switches the presets off again (upstream behaviour: every shell command is refused "
-              "with `SANDBOX_UNAVAILABLE`). The manifest describes both in the optional field `runtime.permissions`.",
+              "by the harness's own refusal, which carries no code; see the README). The manifest describes both in the optional field `runtime.permissions`, "
+              "version 2: the approval question carries the whole text of the command (never cut; above "
+              f"{permission_module_facts()[1]:,} bytes the call is refused with the code `APPROVAL_TEXT_TOO_LARGE` instead of being asked), "
+              "and every denial of the gate has a code in the `tool/result` event.",
               "",
               "The module pack is on by default and `DSH_RUNTIME_MODULE_PACK=0` turns it off (see the README). "
               "Smoke test times are from the GitHub Actions runner under a Linux build of the same proot "

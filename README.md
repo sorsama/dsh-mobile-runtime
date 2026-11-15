@@ -229,7 +229,7 @@ appears.
 | `runtime.fakeProc[]` | array of `{source, target}` | Files to bind over `/proc` entries (see "Running"). Paths are inside the guest. |
 | `runtime.resolvConf` | string | `/etc/resolv.conf`, the file the app should rewrite with the device DNS servers. |
 | `runtime.startup` | object, optional | Describes the start-up work in the harness layer. `startup.modulePack` has `enabledByDefault` (true), `disableEnv` (`DSH_RUNTIME_MODULE_PACK`), `disableValue` (`0`), `directory`, `buildIdFile`, `mechanism` and `validatedNodeVersion`. For information only: the app needs no change. |
-| `runtime.permissions` | object, optional | Present when this harness layer has the two permission presets and the environment switches (see "Shell commands and permissions on Android"). An installed runtime without it has none of that. Fields: `version` (1), `patch` (the overlay file in the guest), `catalogMethod` (`permissionPresets/catalog`), `presets[]` (each `{id, name, envValue, approval, asksBeforeCommands}`; the ids and names are what the running harness reports: `danger-full-access` "Full access", `ask-commands` "Ask before commands"), `defaultEnv` (`DSH_RUNTIME_DEFAULT_PERMISSION`), `defaultEnvValues` (`["full", "ask"]`), `defaultWhenUnset` (`danger-full-access`), `defaultForUnknownValue` (`ask-commands`), `disableEnv` (`DSH_RUNTIME_MOBILE_PATCH`), `disableValue` (`0`), `approvalChannel` (free text). |
+| `runtime.permissions` | object, optional | Present when this harness layer has the two permission presets and the environment switches (see "Shell commands and permissions on Android"). An installed runtime without it has none of that. Fields: `version` (2; version 1 cut the approval text at 2,000 characters and had no denial codes, version 2 adds `approvalTextComplete`, `approvalTextLimitBytes`, `denialCodeField` and `denialCodes`, nothing else changed), `patch` (the overlay file in the guest), `catalogMethod` (`permissionPresets/catalog`), `presets[]` (each `{id, name, envValue, approval, asksBeforeCommands}`; the ids and names are what the running harness reports: `danger-full-access` "Full access", `ask-commands` "Ask before commands"), `defaultEnv` (`DSH_RUNTIME_DEFAULT_PERMISSION`), `defaultEnvValues` (`["full", "ask"]`), `defaultWhenUnset` (`danger-full-access`), `defaultForUnknownValue` (`ask-commands`), `disableEnv` (`DSH_RUNTIME_MOBILE_PATCH`), `disableValue` (`0`), `approvalChannel` (free text), `approvalTextComplete` (`true`: the question carries the whole text), `approvalTextLimitBytes` (`262144`: the largest text one question can carry; above it the call is refused), `denialCodeField` (where the client reads a denial code, free text) and `denialCodes[]` (each `{code, when}`). |
 | `previous` | object, optional | The release before this one, so the app can offer "go back to the previous version". Absent in the first release. `previous.releaseId`, `previous.harnessVersion` (string), `previous.sequence` (int) and `previous.manifestUrl` (string, the URL of that release's `manifest.json`; its signature is `manifest.json.sig` in the same directory). The app fetches that manifest, verifies its signature with the same pinned key and installs it only on an explicit user action. See "How updates reach the app". |
 | `archs` | object | Keyed by Android ABI (`arm64-v8a`, `x86_64`). |
 | `archs.<abi>.debianArch` | string | `arm64` or `amd64`. |
@@ -537,13 +537,60 @@ the harness already uses (`approval/request`, answered `allowed-once` or `reject
 command in the reason and in `displayReason.en`. Only an `allowed-once` answer lets that one call
 run. A reject, a cancel, no answering client, or an error ends in a denial, and nothing runs.
 
+**The question carries the whole text, or the call is refused.** The text is the command of `bash`
+and the persistent shell, the program of `run_code`, the `input` of `terminal_send`, and for the other
+gated calls (`plugin_manager`, and the path of a `write` or `edit` outside the workspace) the text the
+call is summarised to (the arguments as JSON, or the path). It is never cut, shortened or summarised
+(runtimes with `runtime.permissions.version` 1 cut it at 2,000 characters: a user could allow a long
+command after reading only its beginning). `reason` is `<tool>: <text>` and `displayReason.en` is the
+question line, a newline, and then the text, exactly. For a command of 100 KiB the client receives both
+fields in full, and CI checks this end to end through the same client protocol as the app (the last
+bytes of the command are compared, in both fields, at about 100 KiB and at the limit).
+
+**The limit.** One question carries at most **262,144 bytes (256 KiB, counted as UTF-8 bytes, not
+characters)** of text. The harness and its client stream put no lower limit in the way (checked up to
+that size). A call above the limit is **not asked about and does not run**: its tool result is an error
+with the code `APPROVAL_TEXT_TOO_LARGE` and the sentence `<tool>: the text to approve is <n> bytes,
+over the limit of 262144 bytes for one approval. ... Run it in smaller parts.` The user is never shown a
+cut text. The limit applies only to "Ask before commands"; Full access asks nothing and has no limit
+of this kind. (Separately, the operating system cannot start `bash -c` with a command text above about
+128 KiB: the tool result then says `spawn E2BIG`. A `run_code` program or a `plugin_manager` call is not
+subject to that.) What the user is asked about is the text only: other arguments of a call that do not
+change what the text says, such as the `workdir` of `bash`, are not shown, and neither is the content
+of a `write` or `edit` outside the workspace (its path is).
+
+**Denial codes.** Every call this gate refuses ends in a tool result with `isError` true, a sentence for
+the model in the content (unchanged between releases for the cases older releases had; the sentence may
+be reworded, match the code), and a stable code. The client finds the code in the session log, in the
+`tool/result` event of that call: **`data.error.code`**, next to `data.error.name`, which is always
+`DshMobilePermissionDenied`. The event arrives on the `session/follow` stream and is returned by
+`session/events` and `session/page` like any other event. For a subagent the event is in the
+subagent's own log (address `{kind: 'subagent', parentSessionId, childSessionId, mode}`; the
+`childSessionId` is `data.childId` of the `subagent/catalog` event of the parent). CI reads each code it can reach
+there (not the three marked below). The codes (also in the manifest, `runtime.permissions.denialCodes`):
+
+| Code | When | Sentence the model reads (the current text) |
+|---|---|---|
+| `APPROVAL_NOT_AVAILABLE_TO_SUBAGENT` | A subagent of an "Ask before commands" session made a gated call. A subagent cannot ask anyone. | `<tool>: this is a subagent, and the session that started it asks before commands, so this session cannot ask the user for approval and the call was not run. Say so in your reply instead of retrying.` (the same sentence as in older releases) |
+| `APPROVAL_REJECTED_BY_USER` | The user answered reject. | `the user rejected tool "<tool>"` |
+| `APPROVAL_CANCELLED` | The client cancelled the question while the turn was still running. (If the turn itself was stopped, the harness's own "aborted" result is used, as before, with no code from this gate; by design, not exercised by CI.) | `approval for tool "<tool>" was cancelled` |
+| `APPROVAL_UNAVAILABLE` | Nobody answered: no client is connected, or the answer was `unavailable`. | `tool "<tool>" requires approval, but no approval channel is available` |
+| `APPROVAL_TEXT_TOO_LARGE` | The text is over the limit. Nothing was asked. | see above |
+| `APPROVAL_TEXT_UNREADABLE` | The arguments could not be turned into text. Nothing was asked. Not reached by CI; the harness hands the gate arguments that are JSON. | `<tool>: the arguments of this call cannot be shown to the user, so the call was not asked about and was not run.` |
+| `PERMISSION_GATE_ERROR` | The gate itself failed with an exception. The call did not run. | `<tool>: the permission check failed (<message>), so the call was not run.` |
+| `APPROVAL_SWITCHED_OFF` | The owning session has approval switched off but is not on Full access. No preset of this runtime does that, so it is not expected; CI cannot reach it. | `<tool>: approval is switched off in this session, so this session cannot ask ...` |
+| `APPROVAL_OWNER_SESSION_GONE` | The session that started a subagent no longer exists. Not reached by CI. | `<tool>: the session that started this subagent is gone, so there is nobody to ask, so ...` |
+
+A tool result that is an error and has **no** `data.error` is not from this gate (see point 5 under
+"What the app has to do" for the one the app is likely to meet).
+
 | Path | Gated in "Ask before commands"? | Checked by CI |
 |---|---|---|
 | The shell tool `bash` (standard agent preset), also with `run_in_background` | Yes: held for an approval | Yes |
 | The persistent shell (the `bash` tool of the minimal agent preset) | Yes: same tool name | Yes |
 | Code mode `run_code` (the ptc agent preset), whose program can start processes | Yes: held, the approval shows the program | Yes |
 | Tools a code-mode program or a workflow calls | Each nested call goes through the same pipeline, so the gate sees it (by the harness's design; not exercised separately) | No |
-| Subagents (`subagent`, `subagent_fork`, a workflow's `agent()`) | A subagent cannot ask anyone (the harness pins its approval policy to "never"), so its shell calls, `run_code` and file changes outside the workspace are **denied**, and it is told to say so. Subagents of a Full access session run freely | Yes, for `subagent` |
+| Subagents (`subagent`, `subagent_fork`, a workflow's `agent()`) | A subagent cannot ask anyone (the harness pins its approval policy to "never"), so its shell calls, `run_code` and file changes outside the workspace are **denied** with the code `APPROVAL_NOT_AVAILABLE_TO_SUBAGENT`, and it is told to say so. Subagents of a Full access session run freely | Yes, for `subagent` |
 | `plugin_manager` actions that change something (`set_plugin`, `set_bundle`, `install_bundle`, `remove_bundle`, `set_version_exemption`) | Yes. The `list_*` actions are not asked | Yes |
 | `write` and `edit` on a file outside the workspace (the workspace is the session's folder; the temp directory is allowed too) | Yes: held. Inside the workspace they run without a question. Links are followed, so a link inside the workspace that points out is caught | Yes |
 | `read`, `glob`, `grep`, and the web tools | No. They run in both presets. The harness's `read` can return any file, including the stored API key | Yes (`read`) |
@@ -574,8 +621,10 @@ to load would have left "Ask before commands" running commands without asking.
   harness starts with no presets at all. The patch leaves the harness's own deployment default
   (`workspace-write`) in place, and only this module ever puts a session on full access, so every
   shell command is refused as upstream refuses it. Nothing runs unasked.
-- If the module loads and its gate throws while a call is being checked, the harness answers that
-  call with an error and does not run it, even if the user would have allowed it.
+- If the module loads and its gate throws while a call is being checked, the gate answers that call
+  with a denial (code `PERMISSION_GATE_ERROR`) and does not run it, even if the user would have allowed
+  it. (An exception that escaped the gate would end the same way: the harness answers the call with an
+  error and does not run it.)
 
 CI starts the harness with the module missing, with a syntax error, with a constructor that throws,
 with a required service that does not exist, and with a gate that throws, and requires that no
@@ -610,12 +659,33 @@ Two things make a harness version that no longer fits fail the build instead of 
 3. Use `permissionPresets/catalog` for the list of presets, and `/permission <id>` to switch a
    session. Show the app's own localized names and text for `danger-full-access` and `ask-commands`.
 4. Answer `approval/request` as it already does. The command is in `reason` (`bash: <command>`) and in
-   `displayReason.en`. Answer `allowed-once` or `rejected`.
-5. A tool result with the error code `SANDBOX_UNAVAILABLE` means the session is on a mode that needs a
-   kernel sandbox: sessions made by an older runtime that were left on `workspace-write`, or a run
-   with `DSH_RUNTIME_MOBILE_PATCH=0`. The way out is to switch the session to a preset above. Such an
-   old session reports its preset as `custom` until it is switched (checked once by hand against a
-   session made by upstream's harness; not part of CI).
+   `displayReason.en`, always complete (up to 262,144 bytes; a larger one is never asked, see "The
+   limit"). Show all of it, scrolling if needed: a user must not be asked to approve text they cannot
+   read. Answer `allowed-once` or `rejected`.
+   Read a denial from the `tool/result` event: `data.error.code` (list in "Denial codes", also in the
+   manifest as `runtime.permissions.denialCodes`) instead of matching the sentence. Without the field
+   (`runtime.permissions.version` below 2) the sentence is all there is.
+5. **A session left on `workspace-write` is not told apart by a code.** This is the case of a session
+   made by an older runtime that was left on `workspace-write`, or of a run with
+   `DSH_RUNTIME_MOBILE_PATCH=0`: the harness then refuses every shell command because no kernel sandbox
+   can work here. The app does **not** receive the code `SANDBOX_UNAVAILABLE` for it. In harness
+   0.2.2-rc.1 the foreground `bash` tool runs the command as a job, and when the job cannot start it
+   re-throws the failure as a plain `Error` (`throw new Error(view.detail)` in `dsh-tool-bash`,
+   `waitOnJob`), which loses the code that the sandbox error carries. What the client receives is a
+   `tool/result` event with `data.message.isError` true, **no `data.error` at all**, and as its content
+   the single text block
+   `Error: sandbox mode "workspace-write" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL restricted-token runner can start (Windows) — otherwise switch the consumer to danger-full-access.`
+   (the same sentence is the `detail` of the `job/settled` event of that call, with `status: "failed"`).
+   To recognise it, match the start of that sentence (`sandbox mode "` ... `is requested but no sandbox
+   backend is usable on this host`), or better: check the session's preset with `/permission` (it is
+   `workspace-write` or `custom`, not one of the two presets above) and switch it to a preset above.
+   This is an upstream issue (the structured error is lost on the foreground path); a later harness may
+   deliver the code `SANDBOX_UNAVAILABLE` there, so an app can accept both. CI reads exactly what the
+   client gets in this case (on both architectures, under proot, where no sandbox can work) and prints
+   it, accepting either "no code" or `SANDBOX_UNAVAILABLE`. Checked: the foreground `bash` call. Not
+   checked: a background `bash` call (`run_in_background`) in this case.
+   Such an old session reports its preset as `custom` until it is switched (checked once by hand against
+   a session made by upstream's harness; not part of CI).
 6. Do not set `DSH_PERMISSION_MODE`: the patch does not read it.
 
 ## How the build works

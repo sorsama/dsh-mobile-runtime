@@ -7,8 +7,9 @@
       "calls": [ { "name": "bash", "input": { "command": "echo up > @WORK@/upstream.txt; echo OUT-upstream", "description": "t" } } ],
       "expect": {
         "presetText": "current preset workspace-write",
-        "results": [ { "tool": "bash", "isError": true, "match": "no sandbox backend is usable|refusing to run the command unconfined|SANDBOX_UNAVAILABLE" } ],
+        "results": [ { "tool": "bash", "isError": true, "match": "^Error: sandbox mode \"workspace-write\" is requested but no sandbox backend is usable on this host; refusing to run the command unconfined" } ],
         "approvals": [],
+        "codes": [ { "tool": "bash", "code": [null, "SANDBOX_UNAVAILABLE"], "where": "session" } ],
         "files": { "absent": ["@WORK@/upstream.txt"] }
       }
     },

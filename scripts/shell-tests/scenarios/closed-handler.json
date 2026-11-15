@@ -9,6 +9,7 @@
         "presetText": "current preset ask-commands",
         "results": [ { "tool": "bash", "isError": true, "match": "handler boom" } ],
         "approvals": [],
+        "codes": [ { "tool": "bash", "code": "PERMISSION_GATE_ERROR", "where": "session" } ],
         "files": { "absent": ["@WORK@/closed-handler.txt", "@WORK@/../closed-handler-outside.txt"] }
       }
     }

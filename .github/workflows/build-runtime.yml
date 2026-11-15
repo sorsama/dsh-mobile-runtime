@@ -318,7 +318,7 @@ jobs:
           bash "$HERE/verify-manifest.sh" manifest.json manifest.json.sig
           [ "$(jq -r .releaseId manifest.json)" = "$RELEASE_ID" ] || { echo "manifest has another releaseId"; exit 1; }
           # The optional field that tells the app about the permission presets must be there and complete.
-          jq -e '.schemaVersion == 1 and (.runtime.permissions | .version == 1 and .defaultEnv == "DSH_RUNTIME_DEFAULT_PERMISSION" and .disableEnv == "DSH_RUNTIME_MOBILE_PATCH" and ([.presets[].id] == ["danger-full-access", "ask-commands"]))' manifest.json >/dev/null \
+          jq -e '.schemaVersion == 1 and (.runtime.permissions | .version == 2 and .approvalTextComplete == true and .approvalTextLimitBytes == 262144 and (.denialCodes | map(.code) | index("APPROVAL_NOT_AVAILABLE_TO_SUBAGENT") != null and index("APPROVAL_TEXT_TOO_LARGE") != null and index("APPROVAL_REJECTED_BY_USER") != null) and .defaultEnv == "DSH_RUNTIME_DEFAULT_PERMISSION" and .disableEnv == "DSH_RUNTIME_MOBILE_PATCH" and ([.presets[].id] == ["danger-full-access", "ask-commands"]))' manifest.json >/dev/null \
             || { echo "manifest.json lacks a complete runtime.permissions field"; exit 1; }
           awk '{print $2}' SHA256SUMS.txt | sed 's/^\*//' | while read -r f; do
             case "$f" in manifest.json|manifest.json.sig) continue ;; esac

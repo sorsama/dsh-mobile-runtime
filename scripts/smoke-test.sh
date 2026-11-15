@@ -20,7 +20,10 @@
 #      its real tools: Full access runs a shell command without asking; Ask before commands holds it
 #      for an approval that carries the command (allow runs it once, reject and cancel run nothing);
 #      file tools, subagents, plugin_manager, the persistent shell and code mode behave as documented
-#      in both presets; DSH_RUNTIME_DEFAULT_PERMISSION switches the default both ways; the escape hatch
+#      in both presets; the question carries the whole text of a command (about 100 KiB, and exactly the
+#      262144 byte limit; a byte over it is refused, not cut), as the client receives it in `reason` and
+#      `displayReason.en`; every denial of the gate has its code in the tool result event; the harness's own
+#      refusal without a sandbox is read the way the client gets it; DSH_RUNTIME_DEFAULT_PERMISSION switches the default both ways; the escape hatch
 #      DSH_RUNTIME_MOBILE_PATCH=0 gives back upstream's refusal (SANDBOX_UNAVAILABLE); and the
 #      permission module broken in five ways never lets a command run unasked (fail closed);
 #   6. start-to-readiness is measured 3 times for pack on and pack off, and the path
@@ -380,6 +383,8 @@ shell_phase() {
 
 # 1. The default start (DSH_RUNTIME_DEFAULT_PERMISSION unset): Full access, then every Ask before commands case.
 shell_phase default default-full.json ""
+# Ask before commands with large texts, the limit, and the denial codes the other files do not cover (same default).
+shell_phase approval-text approval-text.json ""
 SHELL_CATALOG=$(jq -c '.catalog' "$ST/result-default.json")
 echo "preset catalog as the harness reports it: $SHELL_CATALOG"
 # 2. The default switched to Ask before commands, and a value that is neither full nor ask.

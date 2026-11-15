@@ -1,0 +1,118 @@
+{
+  "comment": "Ask before commands: the user is asked with the whole text of a call, or not asked at all. Nothing is cut. The limit for one approval is 262144 bytes (256 KiB) of text; above it the call is refused with APPROVAL_TEXT_TOO_LARGE and nothing is asked or run. Also the denial codes that the other files do not cover.",
+  "scenarios": [
+    {
+      "name": "ask: a command of about 100 KiB reaches the client whole in both fields, and allowing runs all of it",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "bash", "input": { "command": "echo START-big > @WORK@/big-ran.txt\n@LINES:1600@\necho END-7c41e9 >> @WORK@/big-ran.txt; echo OUT-END-7c41e9", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": false, "match": "OUT-END-7c41e9" } ],
+        "approvals": [ { "tool": "bash", "fullTextOf": 0, "minTextBytes": 102400, "endsWith": "OUT-END-7c41e9" } ],
+        "exactResults": 1,
+        "files": { "contains": { "@WORK@/big-ran.txt": "END-7c41e9" }, "lines": { "@WORK@/big-ran.txt": 2 } }
+      }
+    },
+    {
+      "name": "ask: a command of exactly the limit (262144 bytes) is still asked with its whole text",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "bash", "padToBytes": 262144, "input": { "command": "echo y > @WORK@/limit.txt; : '@PAD@'; echo OUT-LIMIT-END-5e2a", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "bash", "fullTextOf": 0, "minTextBytes": 262144, "endsWith": "OUT-LIMIT-END-5e2a" } ],
+        "codes": [ { "tool": "bash", "code": "APPROVAL_REJECTED_BY_USER", "where": "session" } ],
+        "exactResults": 1,
+        "files": { "absent": ["@WORK@/limit.txt"] }
+      }
+    },
+    {
+      "name": "ask: one byte over the limit is refused with APPROVAL_TEXT_TOO_LARGE, nothing is asked and nothing runs",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "bash", "padToBytes": 262145, "input": { "command": "echo y > @WORK@/over.txt; : '@PAD@'; echo OUT-OVER-END", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "262145 bytes, over the limit of 262144 bytes" } ],
+        "approvals": [],
+        "codes": [ { "tool": "bash", "code": "APPROVAL_TEXT_TOO_LARGE", "where": "session" } ],
+        "exactResults": 1,
+        "files": { "absent": ["@WORK@/over.txt"] }
+      }
+    },
+    {
+      "name": "ask: the limit counts bytes, not characters (140000 two-byte letters are refused)",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "bash", "input": { "command": "echo y > @WORK@/multibyte.txt; : '@E:140000@'", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "over the limit" } ],
+        "approvals": [],
+        "codes": [ { "tool": "bash", "code": "APPROVAL_TEXT_TOO_LARGE", "where": "session" } ],
+        "exactResults": 1,
+        "files": { "absent": ["@WORK@/multibyte.txt"] }
+      }
+    },
+    {
+      "name": "ask: a code-mode program of about 100 KiB is shown whole",
+      "agentPreset": "ptc",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "run_code", "input": { "code": "@JSLINES:1600@\nreturn 'END-PROGRAM-3b9d'", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "run_code", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "run_code", "fullTextOf": 0, "minTextBytes": 102400, "endsWith": "END-PROGRAM-3b9d'" } ],
+        "codes": [ { "tool": "run_code", "code": "APPROVAL_REJECTED_BY_USER", "where": "session" } ]
+      }
+    },
+    {
+      "name": "ask: the arguments summary of another gated call (plugin_manager) is shown whole",
+      "preset": "ask-commands",
+      "answer": "rejected",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "plugin_manager", "input": { "action": "set_bundle", "target": "@LINES:1000@END-ARGS-6d20", "enabled": false } } ],
+      "expect": {
+        "results": [ { "tool": "plugin_manager", "isError": true, "match": "rejected" } ],
+        "approvals": [ { "tool": "plugin_manager", "fullTextOf": 0, "minTextBytes": 60000, "endsWith": "END-ARGS-6d20\",\"enabled\":false}" } ],
+        "codes": [ { "tool": "plugin_manager", "code": "APPROVAL_REJECTED_BY_USER", "where": "session" } ]
+      }
+    },
+    {
+      "name": "ask: the arguments summary of a call over the limit is refused, not cut",
+      "preset": "ask-commands",
+      "answer": "allowed-once",
+      "timeoutSeconds": 120,
+      "calls": [ { "name": "plugin_manager", "input": { "action": "set_bundle", "target": "@LINES:4100@", "enabled": false } } ],
+      "expect": {
+        "results": [ { "tool": "plugin_manager", "isError": true, "match": "over the limit" } ],
+        "approvals": [],
+        "codes": [ { "tool": "plugin_manager", "code": "APPROVAL_TEXT_TOO_LARGE", "where": "session" } ]
+      }
+    },
+    {
+      "name": "ask: no answering client (the question ends as unavailable) is denied with APPROVAL_UNAVAILABLE",
+      "preset": "ask-commands",
+      "answer": "unavailable",
+      "calls": [ { "name": "bash", "input": { "command": "echo y > @WORK@/unavailable.txt", "description": "t" } } ],
+      "expect": {
+        "results": [ { "tool": "bash", "isError": true, "match": "no approval channel is available" } ],
+        "approvals": [ { "tool": "bash", "match": "echo y > .*unavailable" } ],
+        "codes": [ { "tool": "bash", "code": "APPROVAL_UNAVAILABLE", "where": "session" } ],
+        "files": { "absent": ["@WORK@/unavailable.txt"] }
+      }
+    },
+    {
+      "name": "full: the limit does not apply and nothing is asked (a command of 200 KB may fail in the operating system, as spawn E2BIG, but never with the gate's refusal)",
+      "calls": [ { "name": "bash", "input": { "command": "echo OUT-full-large-1; : '@E:100000@'", "description": "t" } } ],
+      "expect": {
+        "presetText": "current preset danger-full-access",
+        "results": [ { "tool": "bash", "match": "^(?!.*over the limit)" } ],
+        "approvals": []
+      }
+    }
+  ]
+}
