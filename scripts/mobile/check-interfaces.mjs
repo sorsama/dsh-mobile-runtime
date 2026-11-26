@@ -39,7 +39,13 @@ need(/kind === "ask"/.test(pipeline) && /kind: "deny"/.test(pipeline), 'dsh-tool
 // hands back `allow`, `cancel` or `deny` with `info`. These are the pipeline's own readings of those.
 need(pipeline.includes('approval.request({') && pipeline.includes('callId: exec.callId'), 'dsh-tools no longer asks the approval service with approval.request({ agent, toolName, callId, reason, displayReason, signal }) (the gate asks the same way)');
 need(/decision\.kind === "cancel"/.test(pipeline), 'dsh-tools no longer knows the pre-execute decision `cancel` (the gate answers it when a turn is stopped during a question)');
-need(/decision\.kind === "deny" \? decision\.info/.test(pipeline) && /error: \{\s*message: denialReason,[\s\S]{0,80}info: denialInfo/.test(pipeline), 'dsh-tools no longer carries the `info` of a pre-execute denial into the tool error (the codes of the gate travel there)');
+// The `info` of the deny decision has to reach the tool error. Up to 0.2.2-rc.1 the pipeline read it
+// on its own (`decision.kind === "deny" ? decision.info`); from 0.2.2-rc.5 it takes the whole decision
+// as the denial (`... : decision`) and reads `{ reason, info }` from it, which carries the same `info`.
+const denialInfoRead = /decision\.kind === "deny" \? decision\.info/.test(pipeline)
+  || (/const denial = decision\.kind === "allow" \? this\.tools\.checkGuards\(exec\) : decision;/.test(pipeline)
+    && /const \{ reason: denialReason, info: denialInfo \} = denial;/.test(pipeline));
+need(denialInfoRead && /error: \{\s*message: denialReason,[\s\S]{0,80}info: denialInfo/.test(pipeline), 'dsh-tools no longer carries the `info` of a pre-execute denial into the tool error (the codes of the gate travel there)');
 
 // 3. The service classes the gate reads.
 const load = async (rel) => import(pathToFileURL(`${nm}/${rel}`).href);
