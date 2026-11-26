@@ -46,6 +46,15 @@ contain or are built from the following third-party software. Versions are pinne
 - License: MIT for Node.js itself, with bundled third-party components under their own
   licenses. The full text is `/opt/node/LICENSE` inside the base layer.
 
+## pnpm
+
+- Files: inside `dsh-runtime-base-<abi>.tar.zst`, under `/opt/corepack` (the `pnpm` npm package
+  and the native binary it downloads on first run), started through `/usr/local/bin/pnpm`.
+- Source: the `pnpm` package from the npm registry (`pnpm.version` in `manifest.json`), fetched by
+  the corepack that ships with Node.js and left unmodified. https://github.com/pnpm/pnpm
+- License: MIT. Its bundled third-party components are listed in `THIRD-PARTY-NOTICES.md` inside
+  the package directory under `/opt/corepack/v1/pnpm/<version>/`.
+
 ## DeepSeek Harness
 
 - Files: `dsh-runtime-harness-<abi>.tar.zst`, under `/opt/dsh`.

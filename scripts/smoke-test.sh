@@ -97,6 +97,11 @@ echo "== guest checks"
 proot_run 'umask 022; set -e
   echo "uid: $(id -u)"; node -v; git --version; rg --version | head -1; curl --version | head -1
   dsh --version
+  # pnpm must run from the prefetched /opt/corepack: any "Downloading ..." line would make got differ from want.
+  want=$(node -p "require(\"/opt/dsh-runtime/base.json\").pnpmVersion")
+  got=$(pnpm --version 2>&1); echo "pnpm $got (want $want)"; [ "$got" = "$want" ]
+  pnpm config get registry
+  echo "pnpm ok"
   node -e "const os=require(\"os\"); console.log(\"os.cpus\", os.cpus().length, \"loadavg\", os.loadavg().length)"
   cd /tmp && rm -rf hl && mkdir hl && cd hl && echo x > a && ln a b && cat b >/dev/null && echo "hard link ok"
   cd /tmp && rm -rf g && git init -q g && cd g && git config user.email ci@example.invalid && git config user.name ci \

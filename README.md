@@ -5,7 +5,8 @@ This repository builds the runtime that lets DSH Mobile run the DeepSeek Harness
 
 - **proot** and its loader, built for Android from source. These go into the app's
   `jniLibs` as `libproot.so` and `libproot-loader.so`.
-- A **base layer**: a minimal Debian trixie (glibc) root file system with Node.js 24 LTS.
+- A **base layer**: a minimal Debian trixie (glibc) root file system with Node.js 24 LTS and
+  pnpm (the harness installs plugins with it).
 - A **harness layer**: the DeepSeek Harness installed under `/opt/dsh`.
 
 The app downloads the layers once, checks them against a signed manifest, unpacks them
@@ -19,7 +20,7 @@ GitHub Actions in this repository and published only as GitHub release assets.
 | `manifest.json` | Describes the release: versions, files, sizes, SHA-256 hashes. |
 | `manifest.json.sig` | Ed25519 signature of `manifest.json`, base64. |
 | `SHA256SUMS.txt` | `sha256sum` output for every other asset. |
-| `dsh-runtime-base-<abi>.tar.zst` | Base layer: Debian, Node.js, runtime support files. |
+| `dsh-runtime-base-<abi>.tar.zst` | Base layer: Debian, Node.js, pnpm, runtime support files. |
 | `dsh-runtime-harness-<abi>.tar.zst` | Harness layer: `/opt/dsh` and `/usr/local/bin/dsh`. |
 | `android-<abi>-libproot.so` | proot for Android. Install as `jniLibs/<abi>/libproot.so`. |
 | `android-<abi>-libproot-loader.so` | proot's loader. Install as `jniLibs/<abi>/libproot-loader.so`. |
@@ -44,9 +45,11 @@ Asset URLs are `assetBaseUrl` from the manifest plus the file name.
   tmp/                    mode 1777, also bound over /dev/shm
   root/                   HOME of the (fake) root user; root/work is the default working dir
   opt/node/               official Node.js build (include/ and share/ removed)
-  usr/local/bin/          node, npm, npx, corepack (symlinks into /opt/node/bin)
+  usr/local/bin/          node, npm, npx, corepack (symlinks into /opt/node/bin);
+                          pnpm, pnpx (a small shell shim, see "pnpm")
+  opt/corepack/           COREPACK_HOME: the pinned pnpm and its native binary, fetched at build time
   opt/dsh-runtime/
-    base.json             {"baseId", "abi", "debianSuite", "debianSnapshot", "nodeVersion"}
+    base.json             {"baseId", "abi", "debianSuite", "debianSnapshot", "nodeVersion", "pnpmVersion"}
     proc/stat             fake /proc files (8 CPUs), see "Running"
     proc/loadavg
     proc/uptime
@@ -219,6 +222,7 @@ appears.
 | `assetBaseUrl` | string | Prefix for asset downloads, ends with `/`. |
 | `harness.package`, `harness.version` | string | `@deepseek-ai/dsh` and its exact npm version. |
 | `node.version`, `node.home` | string | Node.js version, and `/opt/node`. |
+| `pnpm.version`, `pnpm.bin`, `pnpm.corepackHome` | string | Optional (releases before pnpm shipped have no `pnpm` field). The pinned pnpm version, `/usr/local/bin/pnpm`, and `/opt/corepack`. |
 | `debian.suite`, `debian.snapshot` | string | `trixie`, and the snapshot.debian.org timestamp the packages came from. |
 | `debian.baseId` | string | The readable part of the base layer `id`, without the hash suffix. |
 | `proot.repo`, `proot.commit`, `proot.version` | string | Source of proot (`termux/proot`). |
@@ -782,12 +786,41 @@ gh workflow run build-runtime.yml --repo sorsama/dsh-mobile-runtime \
 | `report_failures` | `false` | Open or update the failure issue if this run fails (scheduled runs always do). |
 | `simulate_failure` | `none` | Test only. `early` fails before any build job, `late` fails after signing, just before publishing. |
 
-To change Debian, Node.js, proot or talloc, edit `scripts/versions.env` (bump
+To change Debian, Node.js, pnpm, proot or talloc, edit `scripts/versions.env` (bump
 `BASE_REVISION` when the base recipe changes without a version change).
 
 The signing key's private half exists only in the repository secret `RUNTIME_SIGNING_KEY`
 and in an offline backup. If it is ever replaced, the app must ship the new public key
 before any release signed with it.
+
+## pnpm
+
+The harness installs plugins by running `pnpm` (`pnpm view`, `pnpm add`, `pnpm config`), and
+npm cannot stand in for it. The base layer therefore carries a pinned pnpm (`PNPM_VERSION` in
+`scripts/versions.env`).
+
+- `/usr/local/bin/pnpm` and `/usr/local/bin/pnpx` are `scripts/pnpm-shim.sh`: they run the
+  corepack that ships with Node.js (the same thing `corepack enable --install-directory
+  /usr/local/bin pnpm` links), with `COREPACK_HOME=/opt/corepack`, no download prompt and no
+  rewriting of a project's `package.json`. A `COREPACK_HOME` set by the caller wins. The shim does
+  not depend on any environment variable the app sets.
+- The build runs `corepack prepare pnpm@<version> --activate` into `/opt/corepack`. pnpm 12 is a
+  JavaScript stub that downloads its native binary into the same directory the first time it
+  runs, so the build runs `pnpm --version` once with a network, then again inside a network
+  namespace without one, and fails unless both print the pinned version. The phone needs no
+  network the first time a plugin is installed (installing the plugin itself needs it, of course).
+- A project that pins another pnpm with `packageManager` gets that version, downloaded into
+  `/opt/corepack` on demand.
+- `/opt/corepack` is part of the base layer, which costs the pnpm package and its native binary
+  (about 55 to 80 MB unpacked, depending on the architecture; the release notes list the exact
+  compressed size of each base layer). A base layer with pnpm is a different archive, so apps
+  download the base once more when they update to the first release that has it.
+- The smoke test runs `pnpm --version` and `pnpm config get registry` under proot, and fails if
+  pnpm prints anything but the version recorded in `base.json`.
+
+To check a built layer by hand, unpack it and run
+`chroot <root> /usr/bin/env -i HOME=/root PATH=/usr/local/bin:/usr/bin:/bin pnpm --version`
+(or the same under proot): it must print the pinned version and finish without a network.
 
 ## Licenses
 
