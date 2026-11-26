@@ -122,6 +122,10 @@ def change_notes(prev, manifest, archs):
         lines.append(f"- DeepSeek Harness: {h0} to {h1}." if h0 != h1
                      else f"- DeepSeek Harness: stays at {h1}. This release is a rebuild, not a new harness version.")
         lines.append(f"- Node.js: {n0} to {n1}." if n0 != n1 else f"- Node.js: unchanged at {n1}.")
+        q0, q1 = (prev.get("pnpm") or {}).get("version"), cur["pnpm"]["version"]
+        lines.append(f"- pnpm: {q0} to {q1}." if q0 and q0 != q1
+                     else f"- pnpm: added at {q1}, so plugin installs in the built-in harness find `pnpm`." if not q0
+                     else f"- pnpm: unchanged at {q1}.")
         base_changed = {abi: not same_layer(next((l for l in prev.get("archs", {}).get(abi, {}).get("layers", [])
                                                   if l["name"] == "base"), None),
                                             next(l for l in archs[abi]["layers"] if l["name"] == "base"))
@@ -130,13 +134,15 @@ def change_notes(prev, manifest, archs):
             why = []
             if n0 != n1:
                 why.append(f"Node.js {n0} to {n1}")
+            if q0 != q1:
+                why.append(f"pnpm {q0} to {q1}" if q0 else f"pnpm {q1} added")
             s0, s1 = prev["debian"]["snapshot"], cur["debian"]["snapshot"]
             if s0 != s1:
                 why.append(f"Debian snapshot {s0} to {s1}")
-            lines.append("- Base layer (Debian and Node.js): changed" + (f" ({', '.join(why)})." if why else
+            lines.append("- Base layer (Debian, Node.js and pnpm): changed" + (f" ({', '.join(why)})." if why else
                          " (rebuilt with the same versions, so the archive bytes differ)."))
         else:
-            lines.append("- Base layer (Debian and Node.js): unchanged. Apps that already have it do not download it again.")
+            lines.append("- Base layer (Debian, Node.js and pnpm): unchanged. Apps that already have it do not download it again.")
         p0, p1 = prev["proot"]["commit"], cur["proot"]["commit"]
         lines.append(f"- proot: {p0[:12]} to {p1[:12]}." if p0 != p1 else f"- proot: unchanged ({p1[:12]}).")
         lines += [f"- Rollback: the manifest's `previous` field points at `{pid}` (harness {h0}). "
@@ -220,9 +226,11 @@ def main():
 
     harness_version = layer_docs[ABIS[0]]["harnessVersion"]
     node_version = layer_docs[ABIS[0]]["nodeVersion"]
+    pnpm_version = layer_docs[ABIS[0]]["pnpmVersion"]
     snapshot = layer_docs[ABIS[0]]["debianSnapshot"]
     for abi in ABIS:
-        for k, v in (("harnessVersion", harness_version), ("nodeVersion", node_version), ("debianSnapshot", snapshot)):
+        for k, v in (("harnessVersion", harness_version), ("nodeVersion", node_version),
+                     ("pnpmVersion", pnpm_version), ("debianSnapshot", snapshot)):
             assert layer_docs[abi][k] == v, f"{abi} has a different {k}"
 
     # What the running harness reported for its presets (both architectures must agree); this is what
@@ -281,6 +289,7 @@ def main():
         "assetBaseUrl": f"https://github.com/{a.repo}/releases/download/{a.release_id}/",
         "harness": {"package": "@deepseek-ai/dsh", "version": harness_version, "license": "MIT"},
         "node": {"version": node_version, "home": "/opt/node"},
+        "pnpm": {"version": pnpm_version, "bin": "/usr/local/bin/pnpm", "corepackHome": "/opt/corepack"},
         "debian": {"suite": pins["DEBIAN_SUITE"], "snapshot": snapshot,
                    "baseId": layer_docs[ABIS[0]]["baseId"]},
         "proot": {"repo": pins["PROOT_REPO"], "commit": pins["PROOT_COMMIT"], "version": pins["PROOT_VERSION"],
@@ -336,6 +345,7 @@ def main():
         "|---|---|",
         f"| DeepSeek Harness (`@deepseek-ai/dsh`) | {harness_version} |",
         f"| Node.js | {node_version} |",
+        f"| pnpm | {pnpm_version} |",
         f"| Debian | {pins['DEBIAN_SUITE']}, snapshot {snapshot} |",
         f"| proot | {pins['PROOT_VERSION']} ([`{pins['PROOT_COMMIT'][:12]}`]({pins['PROOT_REPO']}/tree/{pins['PROOT_COMMIT']})), talloc {pins['TALLOC_VERSION']} static, NDK {pins['NDK_VERSION']} |",
         f"| Minimum app version | {a.min_app_version} |",

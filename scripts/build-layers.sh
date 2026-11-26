@@ -87,6 +87,46 @@ for b in node npm npx corepack; do ln -sfn "/opt/node/bin/$b" "$R/usr/local/bin/
 chroot "$R" /opt/node/bin/node -e 'console.log("node", process.version, process.arch)'
 
 ########################################################################
+# The harness installs plugins with `pnpm`, and the phone has no pnpm of its own. Corepack ships
+# with Node.js, so prepare the pinned version here, once, into /opt/corepack (the shim sets
+# COREPACK_HOME to it). pnpm 12 is a thin JavaScript stub that downloads its native binary into
+# that same directory the first time it runs, so run it once here as well: the phone must not need
+# the network the first time it installs a plugin. The checks run in a network namespace without
+# any network to prove it. Nothing here is written outside /opt/corepack and /usr/local/bin.
+log "pnpm $PNPM_VERSION (corepack, prefetched into /opt/corepack)"
+for t in pnpm pnpx; do
+  [ -f "$R/opt/node/lib/node_modules/corepack/dist/$t.js" ] || { echo "corepack has no dist/$t.js in node $NODE_VERSION" >&2; exit 1; }
+  install -m 755 "$HERE/pnpm-shim.sh" "$R/usr/local/bin/$t"
+done
+mkdir -p "$R/opt/corepack" "$R/tmp/pnpm-home"
+rm -f "$R/etc/resolv.conf"; cp /etc/resolv.conf "$R/etc/resolv.conf"
+mount -t proc proc "$R/proc"; mount --rbind /dev "$R/dev"
+pnpm_umount() { umount -R "$R/dev" 2>/dev/null || true; umount "$R/proc" 2>/dev/null || true; }
+trap pnpm_umount EXIT
+# usage: pnpm_root [--offline] command...   (as root in the rootfs, with the env a phone start has)
+pnpm_root() {
+  local net=()
+  if [ "${1:-}" = --offline ]; then net=(unshare --net); shift; fi
+  "${net[@]}" chroot "$R" /usr/bin/env -i HOME=/tmp/pnpm-home USER=root LANG=C.UTF-8 TERM=dumb TMPDIR=/tmp \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/node/bin "$@"
+}
+# --activate records this version as the one used outside a project that pins another.
+pnpm_root env COREPACK_HOME=/opt/corepack COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+  /opt/node/bin/corepack prepare "pnpm@$PNPM_VERSION" --activate
+# The first run fetches pnpm's native binary (it prints a "Downloading" line, here with a network).
+GOT=$(pnpm_root /usr/local/bin/pnpm --version)
+[ "$GOT" = "$PNPM_VERSION" ] || { echo "pnpm reports '$GOT', wanted $PNPM_VERSION" >&2; exit 1; }
+# Now the same without any network: a binary that still had to be downloaded would fail here.
+GOT=$(pnpm_root --offline /usr/local/bin/pnpm --version)
+[ "$GOT" = "$PNPM_VERSION" ] || { echo "offline pnpm reports '$GOT', wanted $PNPM_VERSION" >&2; exit 1; }
+pnpm_root --offline /usr/local/bin/pnpm config get registry
+pnpm_umount; trap - EXIT
+rm -rf "$R"/tmp/* "$R"/tmp/.[!.]*
+PNPM_BYTES=$(du -sb "$R/opt/corepack" | cut -f1)
+log "pnpm $PNPM_VERSION: /opt/corepack is $PNPM_BYTES bytes unpacked"
+find "$R/opt/corepack" -type f -size +1M -printf '   %s %P\n' | sort
+
+########################################################################
 log "rootfs fixes"
 # Android has no /etc/resolv.conf. This placeholder works on most networks; the app
 # should rewrite it at every start from the active network's DNS servers.
@@ -128,7 +168,7 @@ rm -rf "$R"/var/lib/apt/lists/* "$R"/var/cache/apt/* "$R"/var/cache/debconf/*-ol
        "$R"/dev/* "$R"/proc/* "$R"/sys/*
 : > "$R/etc/machine-id"
 cat > "$R/opt/dsh-runtime/base.json" <<EOF
-{"baseId": "$BASE_ID", "abi": "$ABI", "debianSuite": "$DEBIAN_SUITE", "debianSnapshot": "$DEBIAN_SNAPSHOT", "nodeVersion": "$NODE_VERSION"}
+{"baseId": "$BASE_ID", "abi": "$ABI", "debianSuite": "$DEBIAN_SUITE", "debianSnapshot": "$DEBIAN_SNAPSHOT", "nodeVersion": "$NODE_VERSION", "pnpmVersion": "$PNPM_VERSION"}
 EOF
 
 ########################################################################
@@ -235,7 +275,7 @@ dedupe = json.load(open(os.path.join(out, "dedupe-$ABI.json")))
 pack = json.load(open(os.path.join(out, "pack-summary-$ABI.json")))
 align = json.load(open(os.path.join(out, "alignment-$ABI.json")))
 doc = {"abi": "$ABI", "debianArch": "$DEBARCH", "debianSuite": "$DEBIAN_SUITE", "debianSnapshot": "$DEBIAN_SNAPSHOT",
-       "nodeVersion": "$NODE_VERSION", "harnessVersion": "$HARNESS_VERSION", "baseId": "$BASE_ID",
+       "nodeVersion": "$NODE_VERSION", "pnpmVersion": "$PNPM_VERSION", "harnessVersion": "$HARNESS_VERSION", "baseId": "$BASE_ID",
        "sourceDateEpoch": $SOURCE_DATE_EPOCH,
        "base": info("dsh-runtime-base-$ABI", "$BASE_ID"),
        "harness": info("dsh-runtime-harness-$ABI", "dsh-$HARNESS_VERSION"),
